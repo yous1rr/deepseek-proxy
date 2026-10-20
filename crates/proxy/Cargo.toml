@@ -30,3 +30,8 @@ toml = "0.8"
 libc = "0.2"
 jsonschema.workspace = true
 tiktoken-rs = "0.12.1"
+
+# Windows-only: process liveness and termination for the background
+# start/stop/status lifecycle (there is no libc::kill on Windows).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

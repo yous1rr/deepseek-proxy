@@ -15,6 +15,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DEFAULT_LOG_LINES: usize = 50;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Signal numbers passed to `send_signal`. Only the values matter on Unix; on
+// Windows they are ignored and the request maps onto `TerminateProcess`.
+#[cfg(unix)]
+const SIG_TERM: i32 = libc::SIGTERM;
+#[cfg(unix)]
+const SIG_KILL: i32 = libc::SIGKILL;
+#[cfg(windows)]
+const SIG_TERM: i32 = 15;
+#[cfg(windows)]
+const SIG_KILL: i32 = 9;
+
 // ---------------------------------------------------------------------------
 // runtime dir / pidfile
 // ---------------------------------------------------------------------------
@@ -114,6 +125,7 @@ impl Drop for PidGuard {
     }
 }
 
+#[cfg(unix)]
 fn pid_alive(pid: i32) -> bool {
     // Signal 0 only probes for existence; ESRCH means gone, EPERM means alive
     // but owned by someone else (still alive as far as we care).
@@ -123,11 +135,52 @@ fn pid_alive(pid: i32) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn pid_alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(unix)]
 fn send_signal(pid: i32, sig: i32) -> std::io::Result<()> {
     if unsafe { libc::kill(pid, sig) } == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Terminate a background server. Windows has no Unix signals; map both the
+/// graceful (SIGTERM) and forced (SIGKILL) requests onto `TerminateProcess`.
+#[cfg(windows)]
+fn send_signal(pid: i32, _sig: i32) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ok = TerminateProcess(handle, 1);
+        let err = std::io::Error::last_os_error();
+        CloseHandle(handle);
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(err)
+        }
     }
 }
 
@@ -500,11 +553,18 @@ async fn start_with(args: &[String], bg: bool) -> Result<i32, Box<dyn std::error
         println!("running deepseek-rs in foreground (Ctrl-C to stop)...");
         println!("url       {}", base_url(&cfg));
         let exe = std::env::current_exe()?;
-        let err = {
+        #[cfg(unix)]
+        {
             use std::os::unix::process::CommandExt;
-            std::process::Command::new(exe).arg("serve").exec()
-        };
-        return Err(format!("exec serve: {err}").into());
+            let err = std::process::Command::new(exe).arg("serve").exec();
+            return Err(format!("exec serve: {err}").into());
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows has no `exec`: spawn the server and wait for it to exit.
+            let status = std::process::Command::new(exe).arg("serve").status()?;
+            return Ok(status.code().unwrap_or(1));
+        }
     }
 
     let exe = std::env::current_exe()?;
@@ -518,6 +578,7 @@ async fn start_with(args: &[String], bg: bool) -> Result<i32, Box<dyn std::error
         .stdout(log.try_clone()?)
         .stderr(log);
     // Detach into its own session so it survives the shell exiting.
+    #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
@@ -573,7 +634,7 @@ async fn stop() -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(0);
     };
 
-    if let Err(e) = send_signal(pid, libc::SIGTERM) {
+    if let Err(e) = send_signal(pid, SIG_TERM) {
         eprintln!("signal {pid}: {e}");
         return Ok(1);
     }
@@ -589,7 +650,7 @@ async fn stop() -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     eprintln!("pid {pid} ignored SIGTERM; sending SIGKILL");
-    let _ = send_signal(pid, libc::SIGKILL);
+    let _ = send_signal(pid, SIG_KILL);
     tokio::time::sleep(Duration::from_millis(300)).await;
     rt.clear_pid();
     println!("killed    pid {pid}");

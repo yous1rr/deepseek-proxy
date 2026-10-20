@@ -2475,7 +2475,8 @@ pub(crate) async fn connect_pool(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rust ignores SIGPIPE by default, so `deepseek-rs stats | head` panics with
     // "failed printing to stdout: Broken pipe". Restore the usual Unix
-    // behaviour: die quietly when the reader goes away.
+    // behaviour: die quietly when the reader goes away. (No SIGPIPE on Windows.)
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -2592,15 +2593,24 @@ async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    let term = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut s) = signal(SignalKind::terminate()) {
-            s.recv().await;
+    // Windows has no SIGTERM; Ctrl-C / Ctrl-Break are the shutdown triggers.
+    #[cfg(unix)]
+    {
+        let term = async {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut s) = signal(SignalKind::terminate()) {
+                s.recv().await;
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => tracing::info!("SIGINT received, shutting down"),
+            _ = term => tracing::info!("SIGTERM received, shutting down"),
         }
-    };
-    tokio::select! {
-        _ = ctrl_c => tracing::info!("SIGINT received, shutting down"),
-        _ = term => tracing::info!("SIGTERM received, shutting down"),
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        tracing::info!("Ctrl-C received, shutting down");
     }
 }
 
