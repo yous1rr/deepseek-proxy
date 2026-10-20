@@ -149,7 +149,7 @@ fn pid_alive(pid: i32) -> bool {
         let mut code: u32 = 0;
         let ok = GetExitCodeProcess(handle, &mut code);
         CloseHandle(handle);
-        ok != 0 && code == STILL_ACTIVE
+        ok != 0 && code as i32 == STILL_ACTIVE
     }
 }
 
