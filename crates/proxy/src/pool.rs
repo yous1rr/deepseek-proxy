@@ -12,6 +12,7 @@
 
 use client::Client;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,6 +154,17 @@ impl Connection {
             .unwrap_or(true)
     }
 
+    /// Milliseconds before this account may serve traffic again; `0` when it
+    /// is already healthy. Used to build a `Retry-After` hint.
+    #[allow(dead_code)] // reached through `route_checked`, pending main.rs
+    async fn cooldown_remaining_ms(&self) -> u64 {
+        let g = self.gate.lock().await;
+        match g.cooldown_until {
+            Some(until) => until.saturating_duration_since(Instant::now()).as_millis() as u64,
+            None => 0,
+        }
+    }
+
     /// Re-login, replacing the client. Resume ids stay valid.
     ///
     /// Any cached token is dropped first: this path is only reached after the
@@ -224,6 +236,38 @@ impl Drop for RateTicket {
         }
     }
 }
+
+/// Why [`Pool::route_checked`] could not hand out an account.
+///
+/// Deliberately not an error string: callers (the HTTP layer) need to tell "no
+/// capacity right now" apart from real failures so they can answer 503 with a
+/// retry hint instead of hammering a cooling-down account.
+#[allow(dead_code)] // returned by `route_checked`; main.rs maps it to a 503
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteError {
+    /// Every configured account is cooling down, so nothing can be assigned.
+    NoHealthyAccount {
+        /// Remaining cooldown of the account that recovers first, in ms.
+        /// `None` when the pool has no accounts at all.
+        retry_after_ms: Option<u64>,
+    },
+}
+
+impl fmt::Display for RouteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouteError::NoHealthyAccount { retry_after_ms } => {
+                f.write_str("no healthy account available")?;
+                if let Some(ms) = retry_after_ms {
+                    write!(f, ": soonest cooldown ends in {ms} ms")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for RouteError {}
 
 pub struct PoolConfig {
     pub request_delay: Duration,
@@ -313,6 +357,12 @@ impl Pool {
 
     /// Bind a thread to an account: honour an existing/persisted binding, else
     /// assign the least-crowded healthy account.
+    ///
+    /// Unchecked: this cannot report "no capacity", so when every account is
+    /// cooling down it still hands out its stale binding (or account 0). New
+    /// call sites should use [`Pool::route_checked`] and answer 503 on
+    /// [`RouteError::NoHealthyAccount`].
+    #[allow(dead_code)] // compatibility API; production uses route_checked
     pub async fn route(&self, thread_id: &str) -> Arc<Connection> {
         {
             let owner = self.owner.lock().await;
@@ -333,7 +383,9 @@ impl Pool {
         let chosen = if bound.is_some() {
             idx
         } else {
-            self.least_crowded().await
+            // `None` means every account is cooling down; the legacy path keeps
+            // working by falling back to account 0.
+            self.least_crowded_healthy().await.unwrap_or(0)
         };
 
         self.owner
@@ -346,21 +398,102 @@ impl Pool {
         self.conns[chosen].clone()
     }
 
-    async fn least_crowded(&self) -> usize {
+    /// Health-aware [`Pool::route`]: assign the thread an account that can
+    /// actually serve it, or say why it cannot.
+    ///
+    /// Unlike `route()`, this
+    ///
+    /// - never returns an account that is inside its cooldown window;
+    /// - trusts the in-memory binding only while the bound account is healthy,
+    ///   and drops it otherwise so the thread can move;
+    /// - honours a persisted SQLite binding only while that account is healthy:
+    ///   a binding to a cooling-down account is re-pointed at the least-crowded
+    ///   healthy account and persisted, like [`Pool::failover`];
+    /// - returns `Err(RouteError::NoHealthyAccount)` when every account is
+    ///   cooling down instead of silently picking account 0.
+    ///
+    /// Bindings are left untouched when nothing is healthy, so the thread
+    /// returns to its account once the cooldown expires.
+    #[allow(dead_code)] // main.rs will call this instead of `route()`
+    pub async fn route_checked(&self, thread_id: &str) -> Result<Arc<Connection>, RouteError> {
+        // 1. In-memory binding, only while its account can serve traffic.
+        let owner_bound = {
+            let owner = self.owner.lock().await;
+            owner.get(thread_id).copied()
+        };
+        if let Some(idx) = owner_bound {
+            if self.conns[idx].healthy().await {
+                return Ok(self.conns[idx].clone());
+            }
+            // Cooling down: forget the binding so the thread can move.
+            self.owner.lock().await.remove(thread_id);
+        }
+
+        // 2. Persisted binding (survives restart), same health check.
+        let bound = self
+            .store
+            .get_binding(thread_id)
+            .ok()
+            .flatten()
+            .and_then(|email| self.conns.iter().position(|c| c.email == email));
+        if let Some(idx) = bound {
+            if self.conns[idx].healthy().await {
+                self.owner.lock().await.insert(thread_id.to_string(), idx);
+                return Ok(self.conns[idx].clone());
+            }
+        }
+
+        // 3. Fresh assignment among healthy accounts, or an explicit failure.
+        let Some(chosen) = self.least_crowded_healthy().await else {
+            return Err(self.no_healthy_account().await);
+        };
+
+        self.owner
+            .lock()
+            .await
+            .insert(thread_id.to_string(), chosen);
+        if bound != Some(chosen) {
+            let _ = self.store.bind(thread_id, &self.conns[chosen].email);
+        }
+        Ok(self.conns[chosen].clone())
+    }
+
+    /// Least-crowded healthy account, or `None` when every account is cooling
+    /// down.
+    ///
+    /// The old `least_crowded` returned index 0 in that case, which silently
+    /// routed new work to a known-bad account.
+    async fn least_crowded_healthy(&self) -> Option<usize> {
         let counts = self.occupancy().await;
-        let mut best = 0usize;
+        let mut best: Option<usize> = None;
         let mut best_score = usize::MAX;
         for (i, c) in self.conns.iter().enumerate() {
             if !c.healthy().await {
                 continue;
             }
             let score = counts.get(&c.email).copied().unwrap_or(0);
-            if score < best_score {
+            if best.is_none() || score < best_score {
                 best_score = score;
-                best = i;
+                best = Some(i);
             }
         }
         best
+    }
+
+    /// Build the "everything is cooling down" error, carrying the shortest
+    /// remaining cooldown as a retry hint.
+    async fn no_healthy_account(&self) -> RouteError {
+        let mut soonest: Option<u64> = None;
+        for c in &self.conns {
+            let ms = c.cooldown_remaining_ms().await;
+            soonest = Some(match soonest {
+                Some(prev) => prev.min(ms),
+                None => ms,
+            });
+        }
+        RouteError::NoHealthyAccount {
+            retry_after_ms: soonest,
+        }
     }
 
     async fn occupancy(&self) -> HashMap<String, usize> {
@@ -490,5 +623,125 @@ mod tests {
             assert!(!is_rate_limit(msg), "{msg} must be a login error");
             assert!(is_login_dead(msg));
         }
+    }
+
+    /// Pool backed by an in-memory store and token-only clients: no login, no
+    /// network, no database file. Accounts keep their configured order, so
+    /// "account 0" in these tests is `emails[0]`.
+    fn test_pool(emails: &[&str]) -> Pool {
+        let store = crate::store::Store::open_memory().expect("in-memory store");
+        let config = PoolConfig::default();
+        let conns = emails
+            .iter()
+            .map(|email| {
+                Arc::new(Connection::new(
+                    (*email).to_string(),
+                    String::new(),
+                    None,
+                    Client::from_token("test-token".into()),
+                    config.request_delay,
+                    config.queue_limit,
+                    config.queue_timeout,
+                    store.clone(),
+                ))
+            })
+            .collect();
+        Pool {
+            conns,
+            owner: Mutex::new(HashMap::new()),
+            config,
+            store,
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_route_skips_an_account_in_cooldown() {
+        let pool = test_pool(&["a@x", "b@x"]);
+        pool.conns[0].cool_down(Duration::from_secs(60)).await;
+
+        let conn = pool.route_checked("t1").await.expect("healthy account");
+        assert_eq!(conn.email, "b@x", "must not pick the cooling account 0");
+    }
+
+    #[tokio::test]
+    async fn checked_route_moves_a_thread_off_a_cooling_in_memory_binding() {
+        let pool = test_pool(&["a@x", "b@x"]);
+        let first = pool.route_checked("t1").await.expect("healthy account");
+        assert_eq!(first.email, "a@x");
+
+        first.cool_down(Duration::from_secs(60)).await;
+
+        let second = pool.route_checked("t1").await.expect("healthy account");
+        assert_eq!(second.email, "b@x");
+    }
+
+    #[tokio::test]
+    async fn checked_route_rebinds_a_persisted_binding_to_a_cooling_account() {
+        let pool = test_pool(&["a@x", "b@x"]);
+        pool.store.bind("t1", "a@x").unwrap();
+        pool.conns[0].cool_down(Duration::from_secs(60)).await;
+
+        let conn = pool.route_checked("t1").await.expect("healthy account");
+        assert_eq!(conn.email, "b@x");
+        assert_eq!(
+            pool.store.get_binding("t1").unwrap().as_deref(),
+            Some("b@x"),
+            "the cooling binding must be replaced, not reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_route_honours_a_persisted_binding_while_healthy() {
+        let pool = test_pool(&["a@x", "b@x"]);
+        pool.store.bind("t1", "b@x").unwrap();
+
+        let conn = pool.route_checked("t1").await.expect("healthy account");
+        assert_eq!(conn.email, "b@x");
+        assert_eq!(
+            pool.store.get_binding("t1").unwrap().as_deref(),
+            Some("b@x")
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_route_reports_no_account_when_all_are_cooling_down() {
+        let pool = test_pool(&["a@x", "b@x"]);
+        for conn in &pool.conns {
+            conn.cool_down(Duration::from_secs(60)).await;
+        }
+
+        let err = pool
+            .route_checked("t1")
+            .await
+            .err()
+            .expect("no account can serve t1");
+        match err {
+            RouteError::NoHealthyAccount { retry_after_ms } => {
+                let ms = retry_after_ms.expect("both accounts are cooling down");
+                assert!(ms > 0 && ms <= 60_000, "unexpected retry hint: {ms}");
+            }
+        }
+        assert!(
+            err.to_string().contains("no healthy account available"),
+            "{err}"
+        );
+
+        // A failed route must not bind the thread to a bad account.
+        assert!(!pool.owner.lock().await.contains_key("t1"));
+        assert_eq!(pool.store.get_binding("t1").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_route_still_returns_an_account_when_all_are_cooling_down() {
+        let pool = test_pool(&["a@x", "b@x"]);
+        for conn in &pool.conns {
+            conn.cool_down(Duration::from_secs(60)).await;
+        }
+
+        // API compatibility: `route()` cannot fail; the checked path is what
+        // reports "nothing healthy".
+        let conn = pool.route("t1").await;
+        assert_eq!(conn.email, "a@x");
+        assert!(pool.owner.lock().await.contains_key("t1"));
     }
 }

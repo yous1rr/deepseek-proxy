@@ -5,20 +5,22 @@ An OpenAI-compatible API server for DeepSeek. One binary, no runtime.
 DeepSeek's chat has no public API. This server exposes the standard OpenAI
 `/v1/chat/completions` surface, translates each request into what DeepSeek's
 web client actually sends — login, proof-of-work, server-side sessions,
-streamed tokens — and returns ordinary OpenAI JSON or SSE.
+web client actually sends — login, proof-of-work, server-side sessions,
+streamed tokens — and returns ordinary OpenAI-compatible SSE.
 
 Point any OpenAI client at it and it works.
 
 ```bash
 curl http://127.0.0.1:9174/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hello"}],"stream":true}'
 ```
 
 ## Features
 
-- **OpenAI-compatible** — `/v1/chat/completions` and `/v1/models`, streaming
-  and non-streaming, with `tool_calls` deltas and usage accounting.
+- **OpenAI-compatible streaming** — `/v1/chat/completions` and `/v1/models`,
+  with `tool_calls` deltas and usage accounting. `stream: true` is required;
+  non-streaming JSON responses are not supported.
 - **Tool calling** — JSON-Schema validated arguments, and a bounded repair turn
   when the model emits a malformed call instead of surfacing the error.
 - **Sessions** — conversations resume server-side, keyed by the client's session
@@ -116,8 +118,8 @@ Login tokens are cached and reused across restarts. A token the server rejects
 is dropped and fetched again on the next attempt, so a stale cache heals
 itself. An explicit `DEEPSEEK_TOKEN_<i>` always wins.
 
-`deepseek-rs check` verifies login and proof-of-work for every account and
-exits non-zero on failure.
+`deepseek-rs check` verifies login for every configured account and probes the
+PoW challenge path, exiting non-zero on failure.
 
 ## Client authentication
 
@@ -135,7 +137,7 @@ closing before exposing the port.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | Completions, streaming or not |
+| `POST` | `/v1/chat/completions` | Streaming completions (`stream: true`) |
 | `GET` | `/v1/models` | Advertised model ids |
 | `GET` | `/healthz` | Liveness |
 | `GET` | `/readyz` | Readiness |

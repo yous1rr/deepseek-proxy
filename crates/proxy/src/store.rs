@@ -308,13 +308,22 @@ impl Store {
         Ok(())
     }
 
+    /// Drop a thread and its account binding in one transaction, so a deleted
+    /// thread can never leave an orphan binding behind. Deleting an unknown
+    /// thread is a no-op.
     #[allow(dead_code)] // used by tests and future admin UI
     pub fn delete_thread(&self, thread_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().expect("store lock poisoned");
-        conn.execute(
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM threads WHERE thread_id = ?1",
             params![thread_id],
         )?;
+        tx.execute(
+            "DELETE FROM thread_bindings WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -415,6 +424,59 @@ mod tests {
             Some("43"),
             "upsert must overwrite"
         );
+    }
+
+    #[test]
+    fn delete_thread_removes_thread_and_binding() {
+        let s = Store::open_memory().unwrap();
+        s.save_thread(
+            "t1",
+            &ThreadResume {
+                session_id: "sess".into(),
+                parent_message_id: Some("42".into()),
+            },
+        )
+        .unwrap();
+        s.bind("t1", "a@b").unwrap();
+        assert_eq!(s.get_binding("t1").unwrap().as_deref(), Some("a@b"));
+
+        s.delete_thread("t1").unwrap();
+
+        assert_eq!(s.get_thread("t1").unwrap(), None);
+        assert_eq!(s.get_binding("t1").unwrap(), None);
+        assert_eq!(s.counts().unwrap().threads, 0);
+        assert_eq!(s.counts().unwrap().bindings, 0);
+
+        // Deleting again is a harmless no-op.
+        s.delete_thread("t1").unwrap();
+        assert_eq!(s.get_thread("t1").unwrap(), None);
+        assert_eq!(s.get_binding("t1").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_thread_leaves_other_threads_untouched() {
+        let s = Store::open_memory().unwrap();
+        for id in ["t1", "t2"] {
+            s.save_thread(
+                id,
+                &ThreadResume {
+                    session_id: format!("sess-{id}"),
+                    parent_message_id: None,
+                },
+            )
+            .unwrap();
+            s.bind(id, "a@b").unwrap();
+        }
+
+        s.delete_thread("t1").unwrap();
+
+        assert_eq!(s.get_thread("t1").unwrap(), None);
+        assert_eq!(s.get_binding("t1").unwrap(), None);
+        assert_eq!(
+            s.get_thread("t2").unwrap().unwrap().session_id,
+            "sess-t2".to_string()
+        );
+        assert_eq!(s.get_binding("t2").unwrap().as_deref(), Some("a@b"));
     }
 
     #[test]

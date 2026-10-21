@@ -124,7 +124,7 @@ fn de_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
 }
 
 /// Body sent to `/api/v0/chat/completion`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompletionBody {
     pub chat_session_id: String,
     pub parent_message_id: Option<i64>,
@@ -138,7 +138,17 @@ pub struct CompletionBody {
 }
 
 impl CompletionBody {
+    /// Construct a completion body with default model type (`"default"`).
     pub fn new(session_id: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self::new_with_model_type(session_id, prompt, "default")
+    }
+
+    /// Construct a completion body with an explicit upstream model type.
+    pub fn new_with_model_type(
+        session_id: impl Into<String>,
+        prompt: impl Into<String>,
+        model_type: impl Into<String>,
+    ) -> Self {
         Self {
             chat_session_id: session_id.into(),
             parent_message_id: None,
@@ -148,8 +158,34 @@ impl CompletionBody {
             search_enabled: false,
             audio_id: None,
             preempt: false,
-            model_type: "default".into(),
+            model_type: model_type.into(),
         }
+    }
+
+    /// Alias for [`CompletionBody::new_with_model_type`].
+    pub fn new_with_model(
+        session_id: impl Into<String>,
+        prompt: impl Into<String>,
+        model_type: impl Into<String>,
+    ) -> Self {
+        Self::new_with_model_type(session_id, prompt, model_type)
+    }
+
+    /// Builder-style setter to configure or override the upstream model type.
+    pub fn with_model_type(mut self, model_type: impl Into<String>) -> Self {
+        self.model_type = model_type.into();
+        self
+    }
+
+    /// Alias for [`CompletionBody::with_model_type`].
+    pub fn with_model(self, model_type: impl Into<String>) -> Self {
+        self.with_model_type(model_type)
+    }
+
+    /// In-place setter to configure or override the upstream model type.
+    pub fn set_model_type(&mut self, model_type: impl Into<String>) -> &mut Self {
+        self.model_type = model_type.into();
+        self
     }
 }
 
@@ -480,5 +516,95 @@ mod tests {
         .unwrap();
         assert_eq!(b.expire_at, "1792333031301");
         assert_eq!(b.difficulty, 144000);
+    }
+
+    #[test]
+    fn completion_body_default_values_and_serialization() {
+        let body = CompletionBody::new("sess_test_1", "test prompt");
+        assert_eq!(body.model_type, "default");
+        assert_eq!(body.chat_session_id, "sess_test_1");
+        assert_eq!(body.prompt, "test prompt");
+        assert_eq!(body.parent_message_id, None);
+        assert!(body.ref_file_ids.is_empty());
+        assert!(!body.thinking_enabled);
+        assert!(!body.search_enabled);
+        assert_eq!(body.audio_id, None);
+        assert!(!body.preempt);
+
+        let val = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            val,
+            json!({
+                "chat_session_id": "sess_test_1",
+                "parent_message_id": null,
+                "prompt": "test prompt",
+                "ref_file_ids": [],
+                "thinking_enabled": false,
+                "search_enabled": false,
+                "audio_id": null,
+                "preempt": false,
+                "model_type": "default"
+            })
+        );
+    }
+
+    #[test]
+    fn completion_body_model_type_override_preserves_other_defaults() {
+        let default_body = CompletionBody::new("sess_test_2", "hello world");
+        let default_val = serde_json::to_value(&default_body).unwrap();
+
+        let builder_body =
+            CompletionBody::new("sess_test_2", "hello world").with_model_type("deepseek_code");
+        let ctor_body =
+            CompletionBody::new_with_model_type("sess_test_2", "hello world", "deepseek_code");
+        let mut setter_body = CompletionBody::new("sess_test_2", "hello world");
+        setter_body.set_model_type("deepseek_code");
+
+        let alias_builder =
+            CompletionBody::new("sess_test_2", "hello world").with_model("deepseek_code");
+        let alias_ctor =
+            CompletionBody::new_with_model("sess_test_2", "hello world", "deepseek_code");
+
+        assert_eq!(builder_body, ctor_body);
+        assert_eq!(builder_body, setter_body);
+        assert_eq!(builder_body, alias_builder);
+        assert_eq!(builder_body, alias_ctor);
+
+        let overridden_val = serde_json::to_value(&builder_body).unwrap();
+        assert_eq!(overridden_val["model_type"], "deepseek_code");
+
+        // Verify all fields other than model_type remain identical to default
+        let default_obj = default_val.as_object().unwrap();
+        let overridden_obj = overridden_val.as_object().unwrap();
+
+        assert_eq!(default_obj.len(), overridden_obj.len());
+        for (k, v) in default_obj {
+            if k == "model_type" {
+                assert_eq!(v, "default");
+                assert_eq!(overridden_obj[k], "deepseek_code");
+            } else {
+                assert_eq!(
+                    &overridden_obj[k], v,
+                    "field '{k}' unexpectedly changed when overriding model_type"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_body_supports_proxy_model_mappings() {
+        for model in ["default", "deepseek_chat", "deepseek_reasoner", "deepseek_code", "vision"] {
+            let body = CompletionBody::new_with_model_type("session_xyz", "prompt_abc", model);
+            let val = serde_json::to_value(&body).unwrap();
+            assert_eq!(val["model_type"], model);
+            assert_eq!(val["chat_session_id"], "session_xyz");
+            assert_eq!(val["prompt"], "prompt_abc");
+            assert_eq!(val["parent_message_id"], Value::Null);
+            assert_eq!(val["ref_file_ids"], json!([]));
+            assert_eq!(val["thinking_enabled"], false);
+            assert_eq!(val["search_enabled"], false);
+            assert_eq!(val["audio_id"], Value::Null);
+            assert_eq!(val["preempt"], false);
+        }
     }
 }

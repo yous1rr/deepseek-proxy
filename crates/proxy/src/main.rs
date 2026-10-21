@@ -4,7 +4,7 @@
 //!
 //! - `GET  /healthz`
 //! - `GET  /v1/models`
-//! - `POST /v1/chat/completions` (stream + non-stream)
+//! - `POST /v1/chat/completions` (SSE streaming only; `stream: true` required)
 //!
 //! ## Session model
 //!
@@ -16,11 +16,6 @@
 //! newest user message, matching the Python proxy's delta behaviour; a fresh
 //! thread sends the flattened transcript.
 //!
-//! ## Not yet ported
-//!
-//! - SQLite persistence of threads (in-memory only; lost on restart)
-//! - `tools/format.py` prompt + tool-call dialect injection
-//! - multi-account failover
 
 mod cli;
 mod config;
@@ -293,13 +288,32 @@ fn completion_body(
     thinking: bool,
     search: bool,
     ref_file_ids: &[String],
+    model: &str,
 ) -> CompletionBody {
-    let mut body = CompletionBody::new(&thread.session_id, prompt);
+    let mut body = CompletionBody::new_with_model_type(
+        &thread.session_id,
+        prompt,
+        resolve_upstream_model_type(model),
+    );
     body.thinking_enabled = thinking;
     body.search_enabled = search;
     body.parent_message_id = thread.parent_message_id;
     body.ref_file_ids = ref_file_ids.to_vec();
     body
+}
+
+/// Normalize public model ids to the private completion body's model type.
+///
+/// The upstream spelling is kept in one place so completion and image upload
+/// paths cannot silently diverge. `default` preserves the existing wire value;
+/// `expert` and `vision` are the explicit private model types exposed by this
+/// proxy. Their upstream behavior still needs live validation.
+fn resolve_upstream_model_type(model: &str) -> &'static str {
+    match model.trim().to_ascii_uppercase().as_str() {
+        "EXPERT" => "expert",
+        "VISION" => "vision",
+        _ => "default",
+    }
 }
 
 /// First fatal `hint` error in a fully-buffered SSE body, if any.
@@ -326,7 +340,11 @@ async fn rebuild_session(
     key: &str,
     reason: &str,
 ) -> Result<ThreadState, Response> {
-    let conn = state.pool.route(key).await;
+    let conn = state
+        .pool
+        .route_checked(key)
+        .await
+        .map_err(|e| route_unavailable(e).into_response())?;
     let session_id = {
         let _slot = conn
             .acquire()
@@ -704,19 +722,18 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
 
     match state.store.verify_api_key(&presented) {
         Ok(true) => Ok(()),
-        // `require_api_key` raises FastAPI's HTTPException, whose body is
-        // `{"detail": ...}` — not the OpenAI error envelope.
         Ok(false) => {
-            let detail = if presented.is_empty() {
-                "missing api key"
+            let (message, code) = if presented.is_empty() {
+                ("missing api key", "missing_api_key")
             } else {
-                "invalid api key"
+                ("invalid api key", "invalid_api_key")
             };
-            Err((
+            Err(ProxyError::new(
+                message,
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(json!({ "detail": detail })),
+                code,
             )
-                .into_response())
+            .into_response())
         }
         Err(e) => Err(backend_error(&format!("store: {e}"))),
     }
@@ -783,7 +800,7 @@ impl ProxyError {
         json!({
             "error": {
                 "message": self.message,
-                "type": if self.status == axum::http::StatusCode::BAD_REQUEST {
+                "type": if self.status.is_client_error() {
                     "invalid_request_error"
                 } else {
                     "server_error"
@@ -869,7 +886,11 @@ async fn completion_with_retry(
     let max_retries = state.settings.rate_limit_max_retries;
     let backoff = state.settings.rate_limit_backoff_secs.max(0.5);
     let mut attempt = 0u32;
-    let mut conn = state.pool.route(thread_id).await;
+    let mut conn = state
+        .pool
+        .route_checked(thread_id)
+        .await
+        .map_err(|e| CompletionError::QueueUnavailable(e.to_string()))?;
 
     loop {
         // The slot is held for the WHOLE stream, not just until headers land:
@@ -1288,7 +1309,10 @@ async fn chat_completions(
     let thread = match existing {
         Some(t) => t,
         None => {
-            let conn = state.pool.route(&key).await;
+            let conn = match state.pool.route_checked(&key).await {
+                Ok(conn) => conn,
+                Err(e) => return route_unavailable(e).into_response(),
+            };
             let session_id = {
                 let _slot = match conn.acquire().await {
                     Ok(s) => s,
@@ -1314,12 +1338,20 @@ async fn chat_completions(
     let ref_file_ids = match loaded.data {
         None => Vec::new(),
         Some(bytes) => {
-            let conn = state.pool.route(&key).await;
+            let conn = match state.pool.route_checked(&key).await {
+                Ok(conn) => conn,
+                Err(e) => return route_unavailable(e).into_response(),
+            };
             let _slot = match conn.acquire().await {
                 Ok(s) => s,
                 Err(e) => return queue_error(&format!("rate slot: {e}")),
             };
-            match conn.client().await.upload_image(&bytes, &model).await {
+            match conn
+                .client()
+                .await
+                .upload_image(&bytes, resolve_upstream_model_type(&model))
+                .await
+            {
                 Ok(uploaded) => {
                     tracing::info!(
                         thread = %key,
@@ -1347,6 +1379,7 @@ async fn chat_completions(
         thinking,
         state.settings.search_enabled,
         &ref_file_ids,
+        &model,
     );
 
     let id = format!("chatcmpl-{}", uuid_like());
@@ -1785,11 +1818,14 @@ async fn stream_response(
         let mut next = Some((resp, slot));
 
         // Opening chunk: OpenAI always sends the assistant role first.
-        let opening = json!({
+        let mut opening = json!({
             "id": id, "object": "chat.completion.chunk",
             "created": created, "model": model,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
         });
+        if include_usage {
+            opening["usage"] = Value::Null;
+        }
         if tx
             .send(Ok(Event::default().data(opening.to_string())))
             .await
@@ -1888,12 +1924,14 @@ async fn stream_response(
                         Ok(fresh) => {
                             let thinking = body.thinking_enabled;
                             let search = body.search_enabled;
+                            let model_type = body.model_type.clone();
                             body = completion_body(
                                 &fresh,
                                 &replay,
                                 thinking,
                                 search,
                                 &body.ref_file_ids,
+                                &model_type,
                             );
                             session_id = fresh.session_id.clone();
                             cursor = None;
@@ -1951,7 +1989,15 @@ async fn stream_response(
                     Ok(fresh) => {
                         let thinking = body.thinking_enabled;
                         let search = body.search_enabled;
-                        body = completion_body(&fresh, &replay, thinking, search, &body.ref_file_ids);
+                        let model_type = body.model_type.clone();
+                        body = completion_body(
+                            &fresh,
+                            &replay,
+                            thinking,
+                            search,
+                            &body.ref_file_ids,
+                            &model_type,
+                        );
                         // The rebuilt session is a different conversation: point
                         // the cursor at it, or the next turn parents into the
                         // session we just abandoned.
@@ -2011,12 +2057,22 @@ async fn stream_response(
                     hint = %hint,
                     "retrying after backend throttle"
                 );
-                state
-                    .pool
-                    .route(&key)
-                    .await
-                    .cool_down(std::time::Duration::from_secs_f64(wait))
-                    .await;
+                let conn = match state.pool.route_checked(&key).await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        fail_turn(
+                            &state,
+                            &key,
+                            &session_id,
+                            cursor,
+                            &tx,
+                            route_unavailable(e),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                conn.cool_down(std::time::Duration::from_secs_f64(wait)).await;
             } else {
                 state.stats.errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(thread = %key, "upstream hint error: {hint}");
@@ -2125,7 +2181,14 @@ async fn stream_response(
                 parent_message_id: cursor,
                 exchanges: 0,
             };
-            let body = completion_body(&turn_state, &prompt, false, false, &[]);
+            let body = completion_body(
+                &turn_state,
+                &prompt,
+                false,
+                false,
+                &[],
+                &body.model_type,
+            );
             let raw = match completion_with_retry(&state, &key, &body).await {
                 Ok((resp, _slot)) => match resp.text().await {
                     Ok(t) => t,
@@ -2189,11 +2252,14 @@ async fn stream_response(
         // Flush any held-back prose, then emit tool calls (if any).
         let tail = filter.finish();
         if !tail.is_empty() {
-            let chunk = json!({
+            let mut chunk = json!({
                 "id": id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": null}]
             });
+            if include_usage {
+                chunk["usage"] = Value::Null;
+            }
             let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
         }
 
@@ -2213,11 +2279,14 @@ async fn stream_response(
                     })
                 })
                 .collect();
-            let chunk = json!({
+            let mut chunk = json!({
                 "id": id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}]
             });
+            if include_usage {
+                chunk["usage"] = Value::Null;
+            }
             let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
             "tool_calls"
         };
@@ -2236,13 +2305,16 @@ async fn stream_response(
             "stream done"
         );
 
-        let done = json!({
+        let mut done = json!({
             "id": id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
         });
+        if include_usage {
+            done["usage"] = Value::Null;
+        }
         let _ = tx.send(Ok(Event::default().data(done.to_string()))).await;
         // With `include_usage`, OpenAI sends one last chunk with no choices and
         // the token counts, immediately before `[DONE]`.
@@ -2263,7 +2335,12 @@ async fn stream_response(
         persist_cursor(&state.threads, &state.store, &key, &session_id, cursor);
     });
 
-    Sse::new(ReceiverStream::new(rx)).into_response()
+    let mut response = Sse::new(ReceiverStream::new(rx)).into_response();
+    response.headers_mut().insert(
+        "x-accel-buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    response
 }
 
 fn route_all(raw: &str) -> (String, String, Option<i64>) {
@@ -2310,6 +2387,12 @@ fn validate_request(req: &ChatRequest) -> Result<(), ProxyError> {
     // Python proxy does not allow but this port documents deliberately.
     if req.messages.is_empty() {
         return Err(invalid("messages", "List should have at least 1 item"));
+    }
+    if !req.stream {
+        return Err(invalid(
+            "stream",
+            "Only stream=true is supported by this endpoint",
+        ));
     }
     if let Some(id) = &req.thread_id {
         if id.is_empty() || id.chars().count() > 256 {
@@ -2455,7 +2538,20 @@ fn queue_error(msg: &str) -> Response {
     .into_response()
 }
 
-/// Build a connected account pool from resolved config.
+fn route_unavailable(err: pool::RouteError) -> ProxyError {
+    let retry_after = match err {
+        pool::RouteError::NoHealthyAccount { retry_after_ms } =>
+            retry_after_ms.map(|ms| ms.div_ceil(1000).max(1)),
+    };
+    tracing::warn!(error = %err, "no healthy account available");
+    let mut response = ProxyError::new(
+        "No healthy DeepSeek account is currently available",
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "queue_unavailable",
+    );
+    response.retry_after = retry_after;
+    response
+}
 pub(crate) async fn connect_pool(
     cfg: &config::Config,
     store: &store::Store,
@@ -2641,7 +2737,7 @@ mod tests {
             model: None,
             thread_id: None,
             messages,
-            stream: false,
+            stream: true,
             reasoning_effort: None,
             thinking: None,
             reasoning: None,
@@ -2674,7 +2770,6 @@ mod tests {
         })
     }
 
-    #[test]
     /// One delta feeds both the prompt and the image intake, so they can never
     /// disagree about which turn they are describing (Python: `get_new_messages`).
     #[test]
@@ -2725,7 +2820,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_empty_messages_and_unknown_tool_choice() {
-        let mut req = request(vec![], vec![]);
+        let req = request(vec![], vec![]);
         assert_eq!(validate_request(&req).unwrap_err().code, "invalid_request");
 
         let mut req = request(vec![msg_with("user", "hi")], vec![]);
@@ -3100,5 +3195,18 @@ mod tests {
         assert!(text.contains("DROPPED"));
         assert!(text.contains("Never emit the </invoke> ending tag twice."));
         assert!(text.contains(dialect::TEMPLATE));
+    }
+    #[test]
+    fn stream_false_is_rejected_and_model_types_are_normalized() {
+        let mut req = request(vec![msg_with("user", "hi")], vec![]);
+        req.stream = false;
+        let err = validate_request(&req).unwrap_err();
+        assert_eq!(err.param.as_deref(), Some("stream"));
+        assert_eq!(err.code, "invalid_request");
+
+        assert_eq!(resolve_upstream_model_type("DEFAULT"), "default");
+        assert_eq!(resolve_upstream_model_type("deepseek-chat"), "default");
+        assert_eq!(resolve_upstream_model_type("EXPERT"), "expert");
+        assert_eq!(resolve_upstream_model_type("vision"), "vision");
     }
 }
