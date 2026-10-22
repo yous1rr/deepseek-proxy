@@ -73,6 +73,8 @@ impl Default for DeepseekSection {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct LimitsSection {
+    /// Maximum simultaneous upstream requests for one account.
+    pub max_inflight_per_account: usize,
     /// Seconds to wait after one request finishes before starting the next on
     /// the same account (completion-to-start, not start-to-start).
     pub request_delay_secs: f64,
@@ -106,6 +108,7 @@ pub struct LimitsSection {
 impl Default for LimitsSection {
     fn default() -> Self {
         Self {
+            max_inflight_per_account: 1,
             // Measured: sequential requests with no gap do not trip the upstream
             // rate limiter, so the safe default is no delay. Raise it if you see
             // `rate_limit_reached` / `Messages too frequent`.
@@ -132,6 +135,7 @@ pub struct Config {
     pub model: String,
     pub thinking: bool,
     pub search: bool,
+    pub max_inflight_per_account: usize,
     pub request_delay_secs: f64,
     pub queue_limit: usize,
     pub queue_timeout_secs: f64,
@@ -163,6 +167,10 @@ impl Config {
             model: env_str("MODEL_NAME").unwrap_or(file.deepseek.model),
             thinking: env_flag("THINKING_ENABLED", file.deepseek.thinking),
             search: env_flag("SEARCH_ENABLED", file.deepseek.search),
+            max_inflight_per_account: resolve_max_inflight_per_account(
+                file.limits.max_inflight_per_account,
+                env_str("MAX_INFLIGHT_PER_ACCOUNT").as_deref(),
+            ),
             request_delay_secs: env_num("REQUEST_DELAY")
                 .unwrap_or(file.limits.request_delay_secs)
                 .max(0.0),
@@ -185,8 +193,7 @@ impl Config {
             heartbeat_interval_secs: env_num("HEARTBEAT_INTERVAL")
                 .unwrap_or(file.limits.heartbeat_interval_secs)
                 .max(1.0),
-            image_max_bytes: env_num("IMAGE_MAX_BYTES")
-                .unwrap_or(file.limits.image_max_bytes),
+            image_max_bytes: env_num("IMAGE_MAX_BYTES").unwrap_or(file.limits.image_max_bytes),
         })
     }
 
@@ -197,6 +204,15 @@ impl Config {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         toml::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))
     }
+}
+
+/// Pure resolver for `max_inflight_per_account`: defaults to file config,
+/// overridden by environment variable, and clamped to at least 1.
+pub fn resolve_max_inflight_per_account(file_val: usize, env_val: Option<&str>) -> usize {
+    env_val
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(file_val)
+        .max(1)
 }
 
 /// Resolve a relative path against the config file's directory, so a relative
@@ -284,5 +300,28 @@ mod tests {
     fn missing_file_is_not_an_error() {
         let f = Config::read_file("/nonexistent/config.toml").unwrap();
         assert_eq!(f.proxy.port, 9174);
+    }
+
+    #[test]
+    fn toml_max_inflight_per_account() {
+        let f: FileConfig = toml::from_str("[limits]\nmax_inflight_per_account = 4\n").unwrap();
+        assert_eq!(f.limits.max_inflight_per_account, 4);
+    }
+
+    #[test]
+    fn default_max_inflight_per_account_is_one() {
+        let f = FileConfig::default();
+        assert_eq!(f.limits.max_inflight_per_account, 1);
+    }
+
+    #[test]
+    fn test_resolve_max_inflight_per_account() {
+        assert_eq!(resolve_max_inflight_per_account(1, None), 1);
+        assert_eq!(resolve_max_inflight_per_account(3, None), 3);
+        assert_eq!(resolve_max_inflight_per_account(3, Some("5")), 5);
+        assert_eq!(resolve_max_inflight_per_account(0, None), 1);
+        assert_eq!(resolve_max_inflight_per_account(3, Some("0")), 1);
+        assert_eq!(resolve_max_inflight_per_account(4, Some("not-a-number")), 4);
+        assert_eq!(resolve_max_inflight_per_account(0, Some("bad")), 1);
     }
 }

@@ -145,6 +145,10 @@ struct ChatRequest {
     /// Explicit conversation key, mirroring the Python proxy's `thread_id`.
     #[serde(default)]
     thread_id: Option<String>,
+    /// Pi Desktop's OpenAI Completions session fallback. The proxy hashes it
+    /// into the local thread key and never persists the raw value.
+    #[serde(default)]
+    prompt_cache_key: Option<String>,
     #[serde(default)]
     messages: Vec<Msg>,
     #[serde(default)]
@@ -472,24 +476,34 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+struct ResolvedThreadKey {
+    key: String,
+    source: &'static str,
+}
+
 /// Resolve the conversation key for a request.
 ///
 /// Precedence mirrors the Python proxy: explicit `thread_id` body field, then
-/// the `x-thread-id` header, then the client session id (hashed, so a stable
-/// UUID keeps one DeepSeek conversation across compaction), and only then a
-/// hash of the messages. The old message-only hash stranded a conversation on
-/// a fresh remote session every time the first message changed.
-fn thread_key(headers: &HeaderMap, req: &ChatRequest) -> String {
+/// the `x-thread-id` header, then the client session id, then Pi's
+/// `prompt_cache_key`, and only then a hash of the messages. The raw identity
+/// values are never logged or persisted by this layer.
+fn thread_key(headers: &HeaderMap, req: &ChatRequest) -> ResolvedThreadKey {
     if let Some(v) = req
         .thread_id
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        return v.to_string();
+        return ResolvedThreadKey {
+            key: v.to_string(),
+            source: "thread_id",
+        };
     }
     if let Some(v) = header_value(headers, "x-thread-id") {
-        return v;
+        return ResolvedThreadKey {
+            key: v,
+            source: "x-thread-id",
+        };
     }
     // Title calls must be detected before the session id is consulted.
     let prefix = if is_title_request(req) {
@@ -497,25 +511,44 @@ fn thread_key(headers: &HeaderMap, req: &ChatRequest) -> String {
     } else {
         "thread_"
     };
-    if let Some(session) = SESSION_HEADERS
-        .iter()
-        .find_map(|name| header_value(headers, name))
+    for name in SESSION_HEADERS {
+        if let Some(session) = header_value(headers, name) {
+            return ResolvedThreadKey {
+                key: sha256_hex(prefix, &session, None),
+                source: name,
+            };
+        }
+    }
+    if let Some(cache_key) = req
+        .prompt_cache_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
     {
-        return sha256_hex(prefix, &session, None);
+        return ResolvedThreadKey {
+            key: sha256_hex(prefix, cache_key, None),
+            source: "prompt_cache_key",
+        };
     }
     if let Some(first) = req
         .messages
         .iter()
         .find(|m| m.role == "user" && !content_text(&m.content).is_empty())
     {
-        return sha256_hex(prefix, &content_text(&first.content), None);
+        return ResolvedThreadKey {
+            key: sha256_hex(prefix, &content_text(&first.content), None),
+            source: "message_hash",
+        };
     }
     let all: String = req
         .messages
         .iter()
         .map(|m| content_text(&m.content))
         .collect();
-    sha256_hex(prefix, &all, None)
+    ResolvedThreadKey {
+        key: sha256_hex(prefix, &all, None),
+        source: "message_hash",
+    }
 }
 
 /// Label for one message: `user`, `assistant`, `system`, or `tool <name>`.
@@ -883,6 +916,7 @@ async fn completion_with_retry(
         // the caller keeps this ticket alive until the body is drained, so the
         // next request on this account starts `request_delay` after the stream
         // really finished rather than after it merely started.
+        let slot_wait_started = Instant::now();
         let slot = conn.acquire().await.map_err(|e| {
             // `AccountQueueFull` / `AccountQueueTimeout` map to 503 in Python.
             if e.contains("queue") {
@@ -891,6 +925,12 @@ async fn completion_with_retry(
                 CompletionError::Other(e)
             }
         })?;
+        tracing::debug!(
+            thread = %thread_id,
+            attempt,
+            account_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64,
+            "account slot acquired"
+        );
         let client = conn.client().await;
 
         match client.stream_completion(body).await {
@@ -920,13 +960,13 @@ async fn completion_with_retry(
                     return Err(CompletionError::Other(last));
                 }
 
-                // Python: backoff * min(attempt + 1, max(1, max_retries)).
+                // Publish cooldown before releasing the in-flight permit, so
+                // a waiting session cannot start during the retry backoff.
                 let step = (attempt + 1).min(max_retries.max(1)) as f64;
                 let wait = backoff * step;
-                drop(slot);
                 conn.cool_down(std::time::Duration::from_secs_f64(wait))
                     .await;
-
+                drop(slot);
                 if attempt < max_retries {
                     attempt += 1;
                     state.stats.retries.fetch_add(1, Ordering::Relaxed);
@@ -1265,8 +1305,11 @@ async fn chat_completions(
         .with_param("model")
         .into_response();
     }
-    let key = thread_key(&headers, &req);
+    let resolved_key = thread_key(&headers, &req);
+    let key = resolved_key.key;
+    let turn_lock_started = Instant::now();
     let turn = state.turn_guard(&key).await;
+    let turn_lock_wait_ms = turn_lock_started.elapsed().as_millis() as u64;
     // A session and its cursor belong to one account. Keep that connection for
     // uploads, retries and correction turns, including after a cooldown.
     let conn = match state.pool.route_checked(&key).await {
@@ -1289,8 +1332,15 @@ async fn chat_completions(
     let continuation =
         turn_history.can_continue(previous.as_ref(), saved_history.as_ref(), &conn.email);
     let existing = if continuation { previous } else { None };
-    state.stats.total.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(thread = %key, model = %model, messages = req.messages.len(), continuation, "request in");
+    tracing::info!(
+        thread = %key,
+        thread_source = resolved_key.source,
+        turn_lock_wait_ms,
+        model = %model,
+        messages = req.messages.len(),
+        continuation,
+        "request in"
+    );
 
     let system_extra = dialect::inject_tool_descriptions("", &req.tools);
     let (specs, required) = resolve_tools(&req);
@@ -1814,11 +1864,12 @@ async fn stream_response(
                     return;
                 }
             };
-            drop(slot);
             if tx.is_closed() {
+                drop(slot);
                 return;
             }
             if pumped.hint.is_none() && !pumped.complete {
+                drop(slot);
                 state.stats.errors.fetch_add(1, Ordering::Relaxed);
                 fail_turn(
                     &state,
@@ -1851,6 +1902,7 @@ async fn stream_response(
             let Some(hint) = pumped.hint.clone() else {
                 // A completed answer without its own cursor must not certify
                 // the previous parent as the head of this new history.
+                drop(slot);
                 cursor = pumped.parent;
                 break pumped;
             };
@@ -1859,6 +1911,7 @@ async fn stream_response(
             cursor = body.parent_message_id;
 
             if protocol::is_invalid_message_id(&hint) && !pumped.emitted && !cursor_recovered {
+                drop(slot);
                 // `{"code":26,"biz_msg":"invalid message id"}`: the saved
                 // cursor does not exist upstream. Message ids are scoped to a
                 // remote session, so this means the parent was deleted or the
@@ -1922,6 +1975,7 @@ async fn stream_response(
                 }
             } else if protocol::is_context_limit(&hint) {
                 // Context overflow: rebuild the remote session and replay once.
+                drop(slot);
                 if context_recovered || !can_recover || pumped.emitted {
                     state.stats.errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(thread = %key, "upstream hint error: {hint}");
@@ -1980,6 +2034,7 @@ async fn stream_response(
             } else if pool::is_rate_limit(&hint) && !pumped.emitted {
                 let wait = backoff_delay(&state, attempt);
                 if attempt >= state.settings.rate_limit_max_retries {
+                    drop(slot);
                     state.stats.errors.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(
                         thread = %key,
@@ -2015,7 +2070,9 @@ async fn stream_response(
                 );
                 conn.cool_down(std::time::Duration::from_secs_f64(wait))
                     .await;
+                drop(slot);
             } else {
+                drop(slot);
                 state.stats.errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(thread = %key, "upstream hint error: {hint}");
                 let login_dead = pool::is_login_dead(&hint);
@@ -2155,7 +2212,10 @@ async fn stream_response(
                 _ = tx.closed() => return,
                 result = tokio::time::timeout(budget, repair) => match result {
                     Ok(Ok(raw)) => raw,
-                    _ => break,
+                    _ => {
+                        recovery.end_repair();
+                        break;
+                    }
                 },
             };
             if first_hint(&raw).is_some()
@@ -2167,6 +2227,7 @@ async fn stream_response(
                     }
                 })
             {
+                recovery.end_repair();
                 break;
             }
             let (_, repair_text, repair_mid) = route_all(&raw);
@@ -2594,6 +2655,7 @@ pub(crate) async fn connect_pool(
 ) -> Result<Arc<pool::Pool>, Box<dyn std::error::Error>> {
     let pool_config = pool::PoolConfig {
         request_delay: std::time::Duration::from_secs_f64(cfg.request_delay_secs),
+        max_inflight_per_account: cfg.max_inflight_per_account.max(1),
         queue_limit: cfg.queue_limit,
         queue_timeout: std::time::Duration::from_secs_f64(cfg.queue_timeout_secs),
         login_cooldown: std::time::Duration::from_secs(cfg.login_cooldown_secs),
@@ -2775,6 +2837,7 @@ mod tests {
         ChatRequest {
             model: None,
             thread_id: None,
+            prompt_cache_key: None,
             messages,
             stream: true,
             reasoning_effort: None,
@@ -2785,6 +2848,26 @@ mod tests {
             parallel_tool_calls: true,
             stream_options: None,
         }
+    }
+
+    #[test]
+    fn prompt_cache_key_is_a_fallback_thread_identity() {
+        let mut req = request(vec![msg_with("user", "same prompt")], vec![]);
+        req.prompt_cache_key = Some("pi-session-b".into());
+        let resolved = thread_key(&HeaderMap::new(), &req);
+        assert_eq!(resolved.source, "prompt_cache_key");
+        assert_eq!(resolved.key, sha256_hex("thread_", "pi-session-b", None));
+    }
+
+    #[test]
+    fn explicit_session_header_wins_over_prompt_cache_fallback() {
+        let mut req = request(vec![msg_with("user", "same prompt")], vec![]);
+        req.prompt_cache_key = Some("pi-session-b".into());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-affinity", "pi-session-a".parse().unwrap());
+        let resolved = thread_key(&headers, &req);
+        assert_eq!(resolved.source, "x-session-affinity");
+        assert_eq!(resolved.key, sha256_hex("thread_", "pi-session-a", None));
     }
 
     fn bash_tool() -> serde_json::Value {

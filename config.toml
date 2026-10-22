@@ -42,6 +42,10 @@ search = false
 # if you actually see `rate_limit_reached` or "Messages too frequent".
 request_delay_secs = 2
 
+# Maximum simultaneous upstream requests per DeepSeek account. A value of 2
+# allows independent Pi sessions to overlap while each session remains serial.
+max_inflight_per_account = 2
+
 # How many requests may queue behind a busy account before being rejected.
 queue_limit = 64
 

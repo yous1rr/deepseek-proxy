@@ -78,6 +78,7 @@ search   = false             # web search (heavily throttled upstream)
 
 [limits]
 request_delay_secs = 2       # pause between requests on one account
+max_inflight_per_account = 2 # independent sessions may overlap per account
 queue_limit        = 64      # requests allowed to queue behind a busy account
 queue_timeout_secs = 120     # how long one may wait for a slot
 request_timeout_secs = 300   # per-turn wall clock
@@ -90,11 +91,24 @@ image_max_bytes = 10485760   # 10 MiB, on bytes and base64 text
 
 Frequently used environment overrides: `PROXY_HOST`, `PROXY_PORT`, `DB_PATH`,
 `CONFIG_PATH`, `DEEPSEEK_RUNTIME_DIR`, `MODEL_NAME`, `THINKING_ENABLED`,
-`SEARCH_ENABLED`, `REQUEST_DELAY`, `QUEUE_LIMIT`, `QUEUE_TIMEOUT`,
-`REQUEST_TIMEOUT`, `HEARTBEAT_INTERVAL`, `IMAGE_MAX_BYTES`,
+`SEARCH_ENABLED`, `REQUEST_DELAY`, `MAX_INFLIGHT_PER_ACCOUNT`, `QUEUE_LIMIT`,
+`QUEUE_TIMEOUT`, `REQUEST_TIMEOUT`, `HEARTBEAT_INTERVAL`, `IMAGE_MAX_BYTES`,
 `RATE_LIMIT_MAX_RETRIES`, `RATE_LIMIT_BACKOFF_S`, `TOOL_REPAIR_MAX_RETRIES`.
 
 Credentials never go in `config.toml`.
+
+## Multi-session rollout
+
+The built-in default for `max_inflight_per_account` is `1`, which preserves
+account-wide serialization. The sample `config.toml` sets it to `2` so
+independent sessions may overlap while each session remains serial. For a
+staged rollout, set `MAX_INFLIGHT_PER_ACCOUNT=2` (or the TOML value), restart
+the proxy, and watch `/stats` plus `account_slot_wait_ms` in the logs.
+
+To roll back, set `MAX_INFLIGHT_PER_ACCOUNT=1` (or the TOML value) and restart.
+Thread bindings and successful history checkpoints are unchanged by this
+switch; no database migration is required. The safe default remains `1` until
+the upstream account's concurrent-request behavior has been observed.
 
 ## Accounts
 
