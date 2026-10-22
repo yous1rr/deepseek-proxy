@@ -27,7 +27,7 @@ proxy → client → protocol → pow
 - `crates/protocol`：DeepSeek SSE 行解析和 fragment 路由。
 - `crates/pow`：DeepSeekHashV1 proof-of-work 实现和 nonce 搜索。
 - `corpus/`：从 DeepSeek completion 接口捕获的 SSE 测试样本，以及 Python 路由器生成的期望结果。
-- `tools/`：生成 corpus 期望结果和设备 ID 的辅助脚本。
+- `tools/`：生成 corpus 期望结果、设备 ID 和分支黑盒验收的辅助脚本。
 
 关键入口：
 
@@ -44,20 +44,20 @@ proxy → client → protocol → pow
 1. 验证 bearer API key。没有注册 API key 时，服务保持开放；注册第一个 key 后开始校验。
 2. 校验消息、模型、工具 schema、`tool_choice`、图片内容和工具消息字段。
 3. 按以下优先级确定线程 key：请求体 `thread_id`、`x-thread-id` header、会话相关 header、首条用户消息的 hash。
-4. 从内存或 SQLite 恢复线程的 DeepSeek session 和 parent message id。
-5. 根据是否已有线程构建 prompt：新线程发送完整 transcript，续接线程只发送最近一轮增量消息。
-6. 从当前增量消息中读取图片。DeepSeek 每轮最多接收一张图片；多张图片保留第一张，并在 prompt 中通知模型其余图片已丢弃。图片可以来自 `data:` URL 或公共 HTTP(S) URL。
-7. 为图片上传或 completion 获取 PoW challenge，解决 nonce 后生成 `X-DS-PoW-Response`。
-8. 通过 `client` 发起 DeepSeek 流式 completion。
+4. 在本地线程锁内固定本轮账号，读取 SQLite 中的 DeepSeek session、parent message id 和成功历史检查点。
+5. 比较所选有效消息前缀的规范化指纹、消息数、模型/工具范围和账号。完全匹配时仅发送最近一轮增量输入；回退、编辑、重新生成、压缩或未知历史新建 session 并 replay 当前请求历史。
+6. 从增量输入或需要 replay 的完整历史读取图片。DeepSeek 每轮最多接收一张图片；多张图片保留第一张，并在 prompt 中通知模型其余图片已丢弃。图片可以来自 `data:` URL 或公共 HTTP(S) URL。
+7. 在上游工作前清除旧可信检查点，为图片上传或 completion 获取 PoW challenge，解决 nonce 后生成 `X-DS-PoW-Response`。
+8. 通过本轮固定账号的 `client` 发起 DeepSeek 流式 completion。
 9. 通过 `protocol` 解析 SSE 和 fragment：
    - `THINK` → OpenAI `reasoning_content`
    - `RESPONSE` → OpenAI `content`
    - `SEARCH` 和结果元数据丢弃
-10. 通过 `proxy` 的流式 pump 输出 OpenAI 风格 SSE chunk，并保存最新的 response message id。
+10. 通过 `proxy` 的流式 pump 输出 OpenAI 风格 SSE chunk，要求上游完成标记，不能将普通 EOF 作为成功。
 11. 如果模型产生工具调用，解析 `<invoke name="tool">{...}</invoke>`，校验工具名和 JSON Schema；格式错误、未知工具、参数错误或缺少必需调用时进入有限次数的 correction turn。
-12. 遇到限流、过期 cursor 或上下文超限时，按错误类型重试、重建 session 或 replay transcript。
+12. 限流重试、过期 cursor/session 重建和工具修复始终使用本轮账号。完整成功后，把最终 cursor、账号绑定和客户端实际收到的 assistant 历史指纹在同一事务中保存，再发送 `[DONE]`。失败、不完整响应和已检测到的客户端断开不留下可信检查点。
 
-同一线程的请求由独立的 Tokio mutex 串行化，避免并发请求读取同一个 parent message id 后形成分支会话。
+同一线程的请求由独立的 Tokio mutex 串行化，锁覆盖历史匹配、上游请求、修复和检查点提交。只持久化当前可信 head；旧分支通过客户端传入的有效历史重建，暂不复用未经验证的任意历史 DeepSeek parent cursor。
 
 ## DeepSeek 客户端和 PoW
 
@@ -78,6 +78,7 @@ SQLite 由 [store.rs](crates/proxy/src/store.rs) 管理，启动时自动迁移�
 
 - `threads`：DeepSeek session 和 parent message id。
 - `thread_bindings`：线程与账号的绑定关系。
+- `thread_history`：成功历史的版本化指纹、账号和消息数，不保存提示、回复或图片正文；随 cursor/绑定一起事务提交。
 - `accounts`：通过 CLI 添加的账号。
 - `account_tokens`：登录后缓存的 bearer token。
 - `api_keys`：API key 的 SHA-256 hash、名称和前缀。
@@ -87,7 +88,7 @@ SQLite 由 [store.rs](crates/proxy/src/store.rs) 管理，启动时自动迁移�
 - 每个账号有独立的请求 gate、队列和冷却状态。
 - 新线程选择健康且占用较少的账号。
 - 线程绑定会写入 SQLite，重启后继续使用原账号。
-- 登录失效时账号进入冷却，线程尝试 failover 到其他健康账号。
+- 登录失效时账号进入冷却，可为下一请求选择其他健康账号；当前请求保持固定账号，新账号不复用旧 session/cursor，而是 replay 当前有效历史。
 - 显式配置的 token 优先于缓存 token；密码登录可以获得新的 token。
 
 账号来源包括：
@@ -198,12 +199,14 @@ help
 cargo test --workspace
 ```
 
-结果：116 个测试全部通过，0 个失败。其中包括：
+结果：145 个测试全部通过，0 个失败。其中包括：
 
 - `client`：7 个测试。
 - `pow`：5 个测试。
 - `protocol`：12 个单元测试和 2 个 corpus 集成测试。
-- `proxy`：90 个测试。
+- `proxy`：119 个测试，其中历史指纹 14 项、分支集成 8 项，覆盖检查点恢复、工具 ID 改写、失败/断开、不完整响应、缺失新 cursor 和异常正文脱敏。
+
+`cargo build -p proxy --bin deepseek-rs`、`git diff --check`、Python 分支验证工具的语法和 `--help` 检查均通过。
 
 格式检查：
 
@@ -211,17 +214,18 @@ cargo test --workspace
 cargo fmt --all -- --check
 ```
 
-当前未通过，已有多个文件存在 rustfmt 差异；本次上下文整理没有自动格式化这些文件。编译还报告两个 warning：`main.rs:2680` 有重复的 `#[test]` 属性，`main.rs:2728` 有不必要的 `mut`。
+全库格式检查仍未通过，差异均位于本次未修改的 client、pow、protocol、config、dialect 和 images 文件。本次修改的 `main.rs`、`history.rs`、`store.rs` 已通过 `rustfmt --check --edition 2021 --config skip_children=true`；未自动格式化其他文件。
 
-`client-smoke` 是联网 smoke test，需要 `../deepseek/.env` 中的外部 DeepSeek 凭据；本次没有执行。
+独立的 `client-smoke` 本次没有执行；联网验证使用下述代理和数据库副本完成。
 
 ## 当前接口范围与真实账号验证
 
 - 聊天接口要求客户端发送 `"stream": true`；非流式响应明确不支持，`stream:false` 或缺省值会在校验阶段返回 400。
-- 指定目录实际包含的数据库文件名是 `D:\deepseek-rs-v0.1.0-windows-amd64\deepseek-rs.db`，不是 `deepseek.db`。验证时通过 `DB_PATH` 使用该文件。
-- 打包版 `deepseek-rs.exe check` 对该数据库完成账号登录和 PoW 检查，返回成功。
-- 使用数据库副本启动临时服务后，`GET /v1/models` 返回 HTTP 200，模型为 `DEFAULT`、`EXPERT`、`VISION`。
-- 使用同一临时服务发起真实 `stream: true` chat，返回 HTTP 200 和 `text/event-stream`，SSE 正常结束于 `[DONE]`，拼接后的回答符合测试提示。临时服务随后停止；原始数据库未用于聊天写入。
+- 本次 Pi Desktop 分支验证使用 `D:\Packages\deepseek-proxy\deepseek-rs.db` 的一致性临时副本，原库仅以只读方式用于备份。
+- 隔离服务只监听 `127.0.0.1:19176`，启动时账号登录、PoW 和 `/healthz` 检查成功。
+- `tools/verify_branches.py` 的 7 个阶段、21 项检查全部通过，覆盖普通续接、回退隔离、两个分支来回切换和同请求重新生成；重启后的远端 session 复用、上下文保留和检查点存在三项检查也全部通过。
+- 隔离服务已停止，临时数据库和便携版 profile 已删除。原数据库的 SHA-256、大小和修改时间在验证前后完全一致。Pi Desktop 源码、安装版客户端及其 profile 未修改。
+- 便携版的真实 provider 请求证据与代理验收范围见 [PI_DESKTOP_BRANCH_VALIDATION.md](PI_DESKTOP_BRANCH_VALIDATION.md)。
 
 ## 功能拓展路线
 

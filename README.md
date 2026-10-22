@@ -5,7 +5,6 @@ An OpenAI-compatible API server for DeepSeek. One binary, no runtime.
 DeepSeek's chat has no public API. This server exposes the standard OpenAI
 `/v1/chat/completions` surface, translates each request into what DeepSeek's
 web client actually sends — login, proof-of-work, server-side sessions,
-web client actually sends — login, proof-of-work, server-side sessions,
 streamed tokens — and returns ordinary OpenAI-compatible SSE.
 
 Point any OpenAI client at it and it works.
@@ -23,8 +22,8 @@ curl http://127.0.0.1:9174/v1/chat/completions \
   non-streaming JSON responses are not supported.
 - **Tool calling** — JSON-Schema validated arguments, and a bounded repair turn
   when the model emits a malformed call instead of surfacing the error.
-- **Sessions** — conversations resume server-side, keyed by the client's session
-  header, so only the new turn is uploaded.
+- **Branch-aware sessions** — resume matching histories with a delta; replay the
+  selected history after edits, regeneration, or revision changes without client changes.
 - **Multiple accounts** — several DeepSeek accounts behind one endpoint, with
   per-account rate gating, health tracking, and failover.
 - **Long threads** — if the backend reports a context limit, the session is
@@ -204,10 +203,10 @@ private, CGNAT, and reserved ranges are refused, and redirects are not followed.
 
 ## Behaviour worth knowing
 
-- **Sessions are keyed by the client's session header** (`session_id`,
-  `x-session-id`, `x-session-affinity`, `x-thread-id`, in that order), falling
-  back to a hash of the first user message. The key maps to a server-side
-  DeepSeek session, so the remote side holds the context.
+- **Session keys** prefer body `thread_id`, then `x-thread-id`, then
+  `x-session-affinity`, `x-opencode-session`, `x-session-id`, and `session_id`.
+  Without an explicit identity the first user message supplies a fallback hash.
+  Distinct conversations should send distinct session keys.
 - **Context limits are recovered, not reported.** A limit on a continuation
   triggers a fresh remote session and one transcript replay. Only before any
   content is sent, and only for existing threads.
@@ -217,6 +216,44 @@ private, CGNAT, and reserved ranges are refused, and redirects are not followed.
   served; what cannot be retried fails with a typed error.
 - **Stale cursors rebuild the session** from the transcript once rather than
   failing the turn.
+
+## Session branches
+
+Send the complete effective `messages` history for the branch you selected,
+with `stream: true` and a stable session header. Pi Desktop already sends this
+shape for edit/resend, regeneration and revision switching. No client patch or
+new branch header is required.
+
+The proxy compares a canonical history fingerprint against the last successful
+head before reusing the remote session and cursor. Ordinary continuation sends
+only the new input upstream. Rewinding, editing earlier messages, regenerating
+the same request, changing the model/tool contract, or receiving a compacted
+history starts a fresh DeepSeek session and replays the selected history. A
+new Pi Desktop fork uses its own session key and is an independent thread.
+
+An additive SQLite `thread_history` table stores only the fingerprint, account
+identity and message count. Successful checkpoints survive restart; old
+databases replay once before establishing a trusted checkpoint. Incomplete or
+failed streams do not establish a trusted head. Sessions and cursors stay on
+one account for the entire turn; an authentication failure may rebind the next
+request, which then replays on that account instead of reusing a foreign cursor.
+
+This release reconstructs selected branches; it does not reuse arbitrary old
+DeepSeek parent cursors or expose a branch-management API. Delta-only client
+histories cannot identify a rewind reliably and may cause a fresh replay.
+Replay retains the existing one-image-per-prompt limit and reports dropped
+attachments.
+
+Run the synthetic live verification against an isolated proxy and database copy:
+
+```bash
+python tools/verify_branches.py --base-url http://127.0.0.1:19176/v1 --db /path/to/test-copy.db
+```
+
+Use `--api-key-env NAME` when that test instance requires a key. The verifier
+uses read-only SQLite access and never starts the server or edits credentials.
+See [the implementation plan](BRANCH_IMPLEMENTATION_PLAN.md) and
+[portable-client evidence](PI_DESKTOP_BRANCH_VALIDATION.md).
 
 ## Architecture
 

@@ -20,6 +20,7 @@
 mod cli;
 mod config;
 mod dialect;
+mod history;
 mod images;
 mod log;
 mod pool;
@@ -38,7 +39,7 @@ use axum::{
 use client::{CompletionBody, COMPLETION_PATH};
 use futures_util::StreamExt;
 use protocol::{route_event, Channel, FragmentRouter};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -98,10 +99,7 @@ impl AppState {
     /// The guard is held from before the parent id is read until the whole turn
     /// (including every correction turn) is finished, which is what keeps two
     /// overlapping requests on one thread from forking the conversation.
-    async fn turn_guard(
-        &self,
-        key: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
+    async fn turn_guard(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut map = self.turns.lock().await;
             map.entry(key.to_string())
@@ -175,7 +173,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Msg {
     role: String,
     #[serde(default)]
@@ -337,46 +335,39 @@ fn first_hint(raw: &str) -> Option<String> {
 /// the whole transcript into it. Persisted resume state is reset to match.
 async fn rebuild_session(
     state: &AppState,
+    conn: &Arc<pool::Connection>,
     key: &str,
     reason: &str,
 ) -> Result<ThreadState, Response> {
-    let conn = state
-        .pool
-        .route_checked(key)
-        .await
-        .map_err(|e| route_unavailable(e).into_response())?;
     let session_id = {
-        let _slot = conn
-            .acquire()
-            .await
-            .map_err(|e| queue_error(&format!("rate slot: {e}")))?;
+        let _slot = conn.acquire().await.map_err(|e| queue_error(&e))?;
         conn.client()
             .await
             .create_chat_session()
             .await
             .map_err(|e| backend_error(&format!("create_session: {e}")))?
     };
-    tracing::warn!("thread {key}: {reason}; rebuilding in a new remote session");
-
+    tracing::info!(thread = %key, reason, "creating a new remote session");
     let fresh = ThreadState {
         session_id,
         parent_message_id: None,
-        // A rebuilt session replays the whole transcript, so the counters
-        // restart with it.
         exchanges: 0,
     };
+    state
+        .store
+        .save_thread(
+            key,
+            &store::ThreadResume {
+                session_id: fresh.session_id.clone(),
+                parent_message_id: None,
+            },
+        )
+        .map_err(|e| backend_error(&format!("save new thread: {e}")))?;
     state
         .threads
         .lock()
         .unwrap()
         .insert(key.to_string(), fresh.clone());
-    let _ = state.store.save_thread(
-        key,
-        &store::ThreadResume {
-            session_id: fresh.session_id.clone(),
-            parent_message_id: None,
-        },
-    );
     Ok(fresh)
 }
 
@@ -728,12 +719,10 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
             } else {
                 ("invalid api key", "invalid_api_key")
             };
-            Err(ProxyError::new(
-                message,
-                axum::http::StatusCode::UNAUTHORIZED,
-                code,
+            Err(
+                ProxyError::new(message, axum::http::StatusCode::UNAUTHORIZED, code)
+                    .into_response(),
             )
-            .into_response())
         }
         Err(e) => Err(backend_error(&format!("store: {e}"))),
     }
@@ -880,17 +869,14 @@ async fn error_for(state: &AppState, key: &str, err: CompletionError) -> ProxyEr
 /// non-stream callers; a mid-stream failure is surfaced as-is.
 async fn completion_with_retry(
     state: &AppState,
+    conn: &Arc<pool::Connection>,
     thread_id: &str,
     body: &CompletionBody,
 ) -> Result<(reqwest::Response, pool::RateTicket), CompletionError> {
     let max_retries = state.settings.rate_limit_max_retries;
     let backoff = state.settings.rate_limit_backoff_secs.max(0.5);
     let mut attempt = 0u32;
-    let mut conn = state
-        .pool
-        .route_checked(thread_id)
-        .await
-        .map_err(|e| CompletionError::QueueUnavailable(e.to_string()))?;
+    let mut token_recovered = false;
 
     loop {
         // The slot is held for the WHOLE stream, not just until headers land:
@@ -913,24 +899,20 @@ async fn completion_with_retry(
                 let last = e.to_string();
 
                 if pool::is_login_dead(&last) {
-                    tracing::warn!("account {} login-dead: {last}", conn.email);
                     drop(slot);
-                    match state.pool.failover(thread_id).await {
-                        Some(next) => {
-                            tracing::warn!("thread failed over to {}", next.email);
-                            conn = next;
-                            continue;
-                        }
-                        // No healthy account left: this is a login failure, not a
-                        // generic backend error, and `error_for()` says so.
-                        None => return Err(CompletionError::LoginDead(last)),
-                    }
+                    // error_for may route the NEXT request to a replacement.
+                    // Never reuse this account's remote session on that account.
+                    return Err(CompletionError::LoginDead(last));
                 }
 
-                if pool::is_invalid_token(&last) && state.pool.recover(&conn).await {
-                    tracing::info!("recovered account {}", conn.email);
+                if pool::is_invalid_token(&last) && !token_recovered {
+                    token_recovered = true;
+                    if state.pool.recover(conn).await {
+                        drop(slot);
+                        continue;
+                    }
                     drop(slot);
-                    continue;
+                    return Err(CompletionError::LoginDead(last));
                 }
 
                 if !pool::is_rate_limit(&last) {
@@ -1175,6 +1157,86 @@ async fn completion_error_response(state: &AppState, key: &str, err: CompletionE
     error_for(state, key, err).await.into_response()
 }
 
+/// Request history retained only for this turn; SQLite stores its digest.
+struct TurnHistory {
+    messages: Vec<Value>,
+    scope: String,
+}
+
+impl TurnHistory {
+    fn new(req: &ChatRequest, model: &str) -> Self {
+        let scope = json!([resolve_upstream_model_type(model), req.tools]);
+        Self {
+            messages: req
+                .messages
+                .iter()
+                .map(|m| serde_json::to_value(m).expect("message fields are JSON values"))
+                .collect(),
+            scope: scope.to_string(),
+        }
+    }
+
+    fn base_len(&self) -> usize {
+        self.messages
+            .iter()
+            .rposition(|m| m["role"] == "assistant")
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    fn fingerprint(&self, messages: &[Value]) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.scope.as_bytes());
+        digest.update(b"\0");
+        digest.update(history::fingerprint(messages).as_bytes());
+        format!("branch-v1:{}", hex::encode(digest.finalize()))
+    }
+
+    fn can_continue(
+        &self,
+        previous: Option<&ThreadState>,
+        saved: Option<&store::ThreadHistory>,
+        account: &str,
+    ) -> bool {
+        let base_len = self.base_len();
+        match (previous, saved) {
+            (Some(previous), Some(saved)) => {
+                previous.parent_message_id.is_some()
+                    && base_len > 0
+                    && saved.account_email == account
+                    && saved.message_count == base_len
+                    && saved.fingerprint == self.fingerprint(&self.messages[..base_len])
+            }
+            _ => false,
+        }
+    }
+
+    fn completed(
+        &mut self,
+        prose: &str,
+        calls: &[dialect::ToolCall],
+        account: &str,
+    ) -> store::ThreadHistory {
+        let tool_calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, call)| {
+                json!({
+                    "id": format!("call_{i}"), "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments}
+                })
+            })
+            .collect();
+        self.messages
+            .push(json!({"role": "assistant", "content": prose, "tool_calls": tool_calls}));
+        store::ThreadHistory {
+            fingerprint: self.fingerprint(&self.messages),
+            account_email: account.to_string(),
+            message_count: self.messages.len(),
+        }
+    }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1182,30 +1244,17 @@ async fn chat_completions(
 ) -> Response {
     if let Err(resp) = authorize(&state, &headers) {
         state.stats.auth_failed.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!("rejected request: invalid api key");
         return resp;
     }
-
-    let started = std::time::Instant::now();
-    // `ChatService.validate()` runs before anything is queued: a malformed
-    // request must not take the thread lock or create a remote session.
+    let started = Instant::now();
     if let Err(e) = validate_request(&req) {
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
         return e.into_response();
     }
-    let key = thread_key(&headers, &req);
-    // Serialize turns on this thread. Taken BEFORE the parent id is read and
-    // held until the turn (plus its correction turns) is finished, so a second
-    // request on the same thread waits instead of forking the conversation.
-    let turn = state.turn_guard(&key).await;
     let model = req
         .model
         .clone()
         .unwrap_or_else(|| state.settings.model_name.clone());
-
-    // `ChatService.validate()`: hermes sends the public OpenAI id, the backend
-    // uses internal names. Keep explicit expert/vision selection and fold the
-    // common chat ids onto the default model; reject anything else.
     if !is_supported_model(&model) {
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
         return ProxyError::new(
@@ -1216,135 +1265,91 @@ async fn chat_completions(
         .with_param("model")
         .into_response();
     }
-    tracing::info!(
-        thread = %key,
-        model = %model,
-        stream = req.stream,
-        messages = req.messages.len(),
-        tools = req.tools.len(),
-        "request in"
-    );
+    let key = thread_key(&headers, &req);
+    let turn = state.turn_guard(&key).await;
+    // A session and its cursor belong to one account. Keep that connection for
+    // uploads, retries and correction turns, including after a cooldown.
+    let conn = match state.pool.route_checked(&key).await {
+        Ok(conn) => conn,
+        Err(e) => return route_unavailable(e).into_response(),
+    };
+    let previous = match state.store.get_thread(&key) {
+        Ok(value) => value.map(|r| ThreadState {
+            session_id: r.session_id,
+            parent_message_id: r.parent_message_id.and_then(|p| p.parse().ok()),
+            exchanges: 0,
+        }),
+        Err(e) => return backend_error(&format!("read thread: {e}")),
+    };
+    let saved_history = match state.store.get_thread_history(&key) {
+        Ok(saved) => saved,
+        Err(e) => return backend_error(&format!("read thread history: {e}")),
+    };
+    let turn_history = TurnHistory::new(&req, &model);
+    let continuation =
+        turn_history.can_continue(previous.as_ref(), saved_history.as_ref(), &conn.email);
+    let existing = if continuation { previous } else { None };
     state.stats.total.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(thread = %key, model = %model, messages = req.messages.len(), continuation, "request in");
 
-    // In-memory cache first, then SQLite (survives restarts).
-    let existing = state
-        .threads
-        .lock()
-        .unwrap()
-        .get(&key)
-        .cloned()
-        .or_else(|| {
-            state
-                .store
-                .get_thread(&key)
-                .ok()
-                .flatten()
-                .map(|r| ThreadState {
-                    session_id: r.session_id,
-                    parent_message_id: r.parent_message_id.and_then(|p| p.parse().ok()),
-                    exchanges: 0,
-                })
-        });
-
-    // Tool definitions are taught once, on the first turn of a thread. Later
-    // turns ride on the server-side conversation, like the Python proxy.
     let system_extra = dialect::inject_tool_descriptions("", &req.tools);
-
-    // `tool_choice` / `parallel_tool_calls` are part of the request contract:
-    // "none" drops every tool, a named choice narrows to one function and
-    // implies required, "required" keeps all tools and implies required.
     let (specs, required) = resolve_tools(&req);
-
-    // Attach at most one image for this turn, exactly like Python's
-    // `load_image(messages, IMAGE_MAX_BYTES)` + `upload_image()` pair: the
-    // bytes are uploaded once and the completion references the resulting
-    // file id through `ref_file_ids`. Only the delta is inspected, so an image
-    // from an earlier turn is not uploaded again.
-    //
-    // This runs before the prompt is built because a turn carrying several
-    // images now degrades (first sent, rest dropped) and the model has to be
-    // told what it lost. Failing the turn with a 400 instead would wedge the
-    // thread: the client retries the very same delta, so the rejection repeats
-    // forever and the session never advances.
-    let loaded = match images::load(delta_messages(&req.messages), state.settings.image_max_bytes).await {
-        Ok(l) => l,
+    // Rebuilding a branch replays all of its inputs. Reload its attachment
+    // evidence too, within the existing one-image-per-prompt contract.
+    let inputs = if continuation {
+        delta_messages(&req.messages)
+    } else {
+        &req.messages
+    };
+    let loaded = match images::load(inputs, state.settings.image_max_bytes).await {
+        Ok(loaded) => loaded,
         Err(e) => {
             state.stats.errors.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(thread = %key, error = %e, "rejected image");
             return ProxyError::new(e.0, axum::http::StatusCode::BAD_REQUEST, "invalid_image")
                 .with_param("messages")
                 .into_response();
         }
     };
     let image_note = loaded.note();
-    if image_note.is_some() {
-        state
-            .stats
-            .images_dropped
-            .fetch_add(loaded.dropped as u64, Ordering::Relaxed);
-        tracing::warn!(
-            thread = %key,
-            total = loaded.total,
-            dropped = loaded.dropped,
-            "dropped extra images; sending the first only"
-        );
-    }
-
-    let (prompt, replay) = build_prompts(&req, existing.as_ref(), &system_extra, image_note.as_deref());
+    state
+        .stats
+        .images_dropped
+        .fetch_add(loaded.dropped as u64, Ordering::Relaxed);
+    let (prompt, replay) = build_prompts(
+        &req,
+        existing.as_ref(),
+        &system_extra,
+        image_note.as_deref(),
+    );
     if prompt.is_empty() {
-        tracing::warn!(thread = %key, "rejecting turn: no user message or tool result");
         return bad_request("no user message or tool result in continuation turn");
     }
-    tracing::debug!(
-        thread = %key,
-        fresh = existing.is_none(),
-        prompt_chars = prompt.len(),
-        replay_chars = replay.len(),
-        "turn built"
-    );
-    // A brand-new thread has nothing to replay into, so a limit hit is final.
-    let can_recover = existing.is_some() && !replay.is_empty();
-
-    // Create the remote session lazily, on the first turn for this thread.
+    // Invalidate BEFORE upstream work. An interrupted, failed or unseen answer
+    // must not later be mistaken for a fully acknowledged successful head.
+    if let Err(e) = state.store.clear_thread_history(&key) {
+        return backend_error(&format!("invalidate thread history: {e}"));
+    }
+    let can_recover = continuation && !replay.is_empty();
     let thread = match existing {
-        Some(t) => t,
+        Some(thread) => thread,
         None => {
-            let conn = match state.pool.route_checked(&key).await {
-                Ok(conn) => conn,
-                Err(e) => return route_unavailable(e).into_response(),
-            };
-            let session_id = {
-                let _slot = match conn.acquire().await {
-                    Ok(s) => s,
-                    Err(e) => return queue_error(&format!("rate slot: {e}")),
-                };
-                let client = conn.client().await;
-                match client.create_chat_session().await {
-                    Ok(s) => s,
-                    Err(e) => return backend_error(&format!("create_session: {e}")),
-                }
-            };
-            let t = ThreadState {
-                session_id,
-                parent_message_id: None,
-                exchanges: 0,
-            };
-            tracing::info!(thread = %key, session = %t.session_id, "new remote session");
-            state.threads.lock().unwrap().insert(key.clone(), t.clone());
-            t
+            match rebuild_session(&state, &conn, &key, "new or divergent request history").await {
+                Ok(thread) => thread,
+                Err(response) => return response,
+            }
         }
     };
-
+    state
+        .threads
+        .lock()
+        .unwrap()
+        .insert(key.clone(), thread.clone());
     let ref_file_ids = match loaded.data {
         None => Vec::new(),
         Some(bytes) => {
-            let conn = match state.pool.route_checked(&key).await {
-                Ok(conn) => conn,
-                Err(e) => return route_unavailable(e).into_response(),
-            };
             let _slot = match conn.acquire().await {
-                Ok(s) => s,
-                Err(e) => return queue_error(&format!("rate slot: {e}")),
+                Ok(slot) => slot,
+                Err(e) => return queue_error(&e),
             };
             match conn
                 .client()
@@ -1352,18 +1357,7 @@ async fn chat_completions(
                 .upload_image(&bytes, resolve_upstream_model_type(&model))
                 .await
             {
-                Ok(uploaded) => {
-                    tracing::info!(
-                        thread = %key,
-                        file_id = %uploaded.file_id,
-                        bytes = uploaded.size_bytes,
-                        width = uploaded.width,
-                        height = uploaded.height,
-                        "image uploaded"
-                    );
-                    vec![uploaded.file_id]
-                }
-                // Python degrades to text-only rather than failing the turn.
+                Ok(uploaded) => vec![uploaded.file_id],
                 Err(e) => {
                     tracing::warn!(thread = %key, error = %e, "image upload failed; continuing text-only");
                     Vec::new()
@@ -1371,43 +1365,36 @@ async fn chat_completions(
             }
         }
     };
-
-    let thinking = want_thinking(&req, state.settings.thinking_default);
     let body = completion_body(
         &thread,
         &prompt,
-        thinking,
+        want_thinking(&req, state.settings.thinking_default),
         state.settings.search_enabled,
         &ref_file_ids,
         &model,
     );
-
-    let id = format!("chatcmpl-{}", uuid_like());
-    let created = unix_secs();
-
-    let (resp, slot) = match completion_with_retry(&state, &key, &body).await {
-        Ok(r) => r,
+    let (resp, slot) = match completion_with_retry(&state, &conn, &key, &body).await {
+        Ok(result) => result,
         Err(e) => return completion_error_response(&state, &key, e).await,
     };
-
-    tracing::debug!(thread = %key, thinking, parent = ?thread.parent_message_id, "upstream completion accepted");
-
     stream_response(
         turn,
         state,
         key,
+        conn,
+        turn_history,
         resp,
         slot,
         body,
-        id,
+        format!("chatcmpl-{}", uuid_like()),
         model,
-        created,
+        unix_secs(),
         replay,
         can_recover,
         req.stream_options
             .as_ref()
             .and_then(|o| o.get("include_usage"))
-            .and_then(|v| v.as_bool())
+            .and_then(Value::as_bool)
             .unwrap_or(false),
         started,
         specs,
@@ -1423,6 +1410,8 @@ struct Pumped {
     filter: dialect::StreamToolFilter,
     /// True once any chunk reached the client; a hint after that is fatal.
     emitted: bool,
+    /// A final upstream completion marker was received, not merely EOF.
+    complete: bool,
     /// Fatal `event: hint` payload, if the upstream aborted the stream.
     hint: Option<String>,
     /// Every text fragment seen, for the malformed-call detector. The filter
@@ -1512,6 +1501,12 @@ fn usage_block(prompt_tokens: u64, text: &str, calls: &[dialect::ToolCall]) -> V
 ///   byte, and emits `: keep-alive` while we wait. Python does this with
 ///   `asyncio.wait_for(queue.get(), heartbeat_interval)`.
 /// - The caller bounds the whole turn with `request_timeout`.
+fn is_upstream_finished(value: &Value) -> bool {
+    (value.get("p").and_then(Value::as_str) == Some("response/status")
+        && value.get("v").and_then(Value::as_str) == Some("FINISHED"))
+        || value.pointer("/v/response/status").and_then(Value::as_str) == Some("FINISHED")
+}
+
 async fn pump(
     resp: reqwest::Response,
     tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
@@ -1521,199 +1516,139 @@ async fn pump(
     idle: std::time::Duration,
     include_usage: bool,
 ) -> Pumped {
+    let mut result = Pumped {
+        parent: None,
+        filter: dialect::StreamToolFilter::new(),
+        emitted: false,
+        complete: false,
+        hint: None,
+        text: String::new(),
+        prose: String::new(),
+        prompt_tokens: 0,
+    };
     let mut router = FragmentRouter::new();
     let mut events = Vec::new();
-    let mut buf = String::new();
-    let mut current_event = String::new();
-    let mut parent: Option<i64> = None;
-    let mut filter = dialect::StreamToolFilter::new();
-    let mut emitted = false;
-    let mut text_all = String::new();
-    let mut prose = String::new();
-    let mut prompt_tokens: u64 = 0;
-    // Diagnostics for the "clean stream, no text" failure: the upstream can
-    // answer with something we cannot route (an HTML/JSON error page on a 200,
-    // or fragments in an unexpected shape). Without the raw bytes the only
-    // visible symptom is "closed the stream without content", which says
-    // nothing about which of those it was.
-    let mut raw_bytes: usize = 0;
-    let mut raw_events: usize = 0;
-    let mut head = String::new();
-
-    let mut byte_stream = resp.bytes_stream();
+    // Buffer bytes until a complete line: a UTF-8 scalar may cross HTTP chunks.
+    let mut pending = Vec::new();
+    let mut event_name = String::new();
+    let mut head = Vec::new();
+    let mut event_count = 0usize;
+    let mut stream = resp.bytes_stream();
     loop {
-        // Python's `stream()` waits `heartbeat_interval` for the next event and
-        // emits `: keep-alive` on timeout — it does NOT kill the stream. The
-        // turn-wide `request_timeout` is what bounds a real hang.
         let next = tokio::select! {
             biased;
-            // The client hung up. Stop reading immediately: otherwise this task
-            // stays parked on the socket forever, never releases the account's
-            // rate slot, and every later request on this account blocks in
-            // `acquire()` — silently, with no log line. Python gets the same
-            // effect from `producer.cancel()` in the stream's `finally`.
-            _ = tx.closed() => {
-                tracing::info!(thread = %id, "client disconnected, stopping upstream read");
-                return Pumped {
-                    parent,
-                    filter,
-                    emitted,
-                    hint: None,
-                    text: text_all,
-                    prose,
-                    prompt_tokens,
-                };
-            }
-            r = tokio::time::timeout(idle, byte_stream.next()) => r,
+            _ = tx.closed() => return result,
+            next = tokio::time::timeout(idle, stream.next()) => next,
         };
-        let chunk = match next {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) => break,
+        let eof = match next {
+            Ok(Some(Ok(bytes))) => {
+                let take = (1024usize.saturating_sub(head.len())).min(bytes.len());
+                head.extend_from_slice(&bytes[..take]);
+                pending.extend_from_slice(&bytes);
+                false
+            }
+            Ok(Some(Err(e))) => {
+                result.complete = false;
+                result.hint = Some(format!("stream read failed: {e}"));
+                return result;
+            }
+            Ok(None) => {
+                if !pending.is_empty() {
+                    pending.push(b'\n');
+                }
+                true
+            }
             Err(_) => {
                 if tx
                     .send(Ok(Event::default().comment("keep-alive")))
                     .await
                     .is_err()
                 {
-                    break;
+                    return result;
                 }
                 continue;
             }
         };
-        // A read error is a real failure. The old `let Ok(..) else { break }`
-        // turned a dead socket into a clean, empty, *successful* stream — which
-        // is why stalled turns produced no log line and no error at all.
-        let bytes = match chunk {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(thread = %id, error = %e, "upstream stream read failed");
-                return Pumped {
-                    parent,
-                    filter,
-                    emitted,
-                    hint: Some(format!("stream read failed: {e}")),
-                    text: text_all,
-                    prose,
-                    prompt_tokens,
-                };
+        while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(&pending[..pos]).into_owned();
+            pending.drain(..=pos);
+            if line.trim() == "data: [DONE]" {
+                result.complete = true;
+                continue;
             }
-        };
-        raw_bytes += bytes.len();
-        if head.len() < 1024 {
-            head.push_str(&String::from_utf8_lossy(&bytes));
-            if head.len() > 1024 {
-                head.truncate(1024);
-            }
-        }
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].to_string();
-            buf.drain(..=pos);
-            let value = match protocol::classify_line(&line, &mut current_event) {
+            let value = match protocol::classify_line(&line, &mut event_name) {
                 protocol::LineKind::Ignored => continue,
                 protocol::LineKind::HintError { content } => {
-                    return Pumped {
-                        parent,
-                        filter,
-                        emitted,
-                        hint: Some(content),
-                        text: text_all,
-                        prose,
-                        prompt_tokens,
-                    };
+                    result.complete = false;
+                    result.hint = Some(content);
+                    return result;
                 }
                 protocol::LineKind::Event(value) => value,
             };
-            // Last id wins. aiodeepseek's `ask_stream` keeps the final
-            // non-None `message_id` it sees and parents the next turn to that,
-            // so an early id must not win here either.
-            if let Some(mid) = value.get("response_message_id").and_then(|v| v.as_i64()) {
-                parent = Some(mid);
+            event_count += 1;
+            result.complete |= is_upstream_finished(&value);
+            if let Some(mid) = value.get("response_message_id").and_then(Value::as_i64) {
+                result.parent = Some(mid);
             }
-            // `accumulated_token_usage` is patched mid-stream, once as a plain
-            // field and again as a BATCH child. Keep the latest value; Python
-            // reads it off the same field when building its `done` event.
-            if let Some(n) = find_token_usage(&value) {
-                prompt_tokens = n;
+            if let Some(tokens) = find_token_usage(&value) {
+                result.prompt_tokens = tokens;
             }
-            raw_events += 1;
             events.clear();
             route_event(&value, &mut router, &mut events);
             for ev in &events {
                 let delta = match ev.channel {
                     Channel::Text => {
-                        text_all.push_str(&ev.text);
-                        // Tool blocks are held back and surfaced as tool_calls.
-                        let safe = filter.feed(&ev.text);
+                        result.text.push_str(&ev.text);
+                        let safe = result.filter.feed(&ev.text);
                         if safe.is_empty() {
                             continue;
                         }
-                        prose.push_str(&safe);
-                        json!({ "content": safe })
+                        result.prose.push_str(&safe);
+                        json!({"content": safe})
                     }
-                    Channel::Reasoning => json!({ "reasoning_content": ev.text }),
+                    Channel::Reasoning => json!({"reasoning_content": ev.text}),
                 };
                 let mut chunk = json!({
-                    "id": id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+                    "id": id, "object": "chat.completion.chunk", "created": created,
+                    "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
                 });
-                // OpenAI: with `include_usage`, every content chunk carries
-                // `usage: null`; the real numbers arrive in a final chunk.
                 if include_usage {
                     chunk["usage"] = Value::Null;
                 }
-                emitted = true;
+                result.emitted = true;
                 if tx
                     .send(Ok(Event::default().data(chunk.to_string())))
                     .await
                     .is_err()
                 {
-                    return Pumped {
-                        parent,
-                        filter,
-                        emitted,
-                        hint: None,
-                        text: text_all,
-                        prose,
-                        prompt_tokens,
-                    };
+                    return result;
                 }
             }
         }
+        if eof {
+            break;
+        }
     }
-
-    if text_all.is_empty() {
-        tracing::error!(
-            thread = %id,
-            raw_bytes,
-            raw_events,
-            head = %head.replace('\n', "\\n"),
-            "upstream stream ended with no routable text; raw body above"
-        );
+    if event_count == 0 && !head.is_empty() {
+        // Preserve recovery classification without exposing an arbitrary body
+        // (which could contain model output) through hint/error logging.
+        let raw = String::from_utf8_lossy(&head);
+        let hint = if protocol::is_invalid_message_id(&raw) {
+            "invalid message id"
+        } else if protocol::is_context_limit(&raw) {
+            "context_length_exceeded"
+        } else if pool::is_rate_limit(&raw) {
+            "rate limit exceeded"
+        } else if pool::is_login_dead(&raw) {
+            "login failed"
+        } else if pool::is_invalid_token(&raw) {
+            "invalid token"
+        } else {
+            "non-SSE upstream response"
+        };
+        result.hint = Some(hint.to_string());
     }
-
-    // A 200 response that is not an SSE stream at all (a JSON `{code,biz_msg}`
-    // error body) used to fall through as "empty response", hiding the reason.
-    // Surface the body as a hint so the caller can classify it: `code:26`
-    // means the parent id is stale and the turn is retryable.
-    let hint = if raw_events == 0 && !head.trim().is_empty() {
-        Some(format!("non-SSE upstream body: {}", head.trim()))
-    } else {
-        None
-    };
-
-    Pumped {
-        parent,
-        filter,
-        emitted,
-        hint,
-        text: text_all,
-        prose,
-        prompt_tokens,
-    }
+    result
 }
 
 /// Send an OpenAI-shaped SSE error event and stop the stream.
@@ -1782,6 +1717,8 @@ async fn stream_response(
     turn: tokio::sync::OwnedMutexGuard<()>,
     state: AppState,
     key: String,
+    conn: Arc<pool::Connection>,
+    mut turn_history: TurnHistory,
     resp: reqwest::Response,
     slot: pool::RateTicket,
     body: CompletionBody,
@@ -1847,38 +1784,57 @@ async fn stream_response(
             // A stalled upstream becomes a visible error instead of a hang.
             let budget = std::time::Duration::from_secs_f64(state.settings.request_timeout_secs)
                 .saturating_sub(started.elapsed());
-            let pumped =
-                match tokio::time::timeout(
-                    budget,
-                    pump(resp, &tx, &id, &model, created, idle, include_usage),
-                )
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(_) => {
-                        state.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            thread = %key,
-                            timeout_s = state.settings.request_timeout_secs,
-                            "turn timed out waiting for upstream"
-                        );
-                        fail_turn(
-                            &state,
-                            &key,
-                            &session_id,
-                            cursor,
-                            &tx,
-                            ProxyError::new(
-                                "Request processing timed out",
-                                axum::http::StatusCode::GATEWAY_TIMEOUT,
-                                "request_timeout",
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                };
+            let pumped = match tokio::time::timeout(
+                budget,
+                pump(resp, &tx, &id, &model, created, idle, include_usage),
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    state.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        thread = %key,
+                        timeout_s = state.settings.request_timeout_secs,
+                        "turn timed out waiting for upstream"
+                    );
+                    fail_turn(
+                        &state,
+                        &key,
+                        &session_id,
+                        cursor,
+                        &tx,
+                        ProxyError::new(
+                            "Request processing timed out",
+                            axum::http::StatusCode::GATEWAY_TIMEOUT,
+                            "request_timeout",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
             drop(slot);
+            if tx.is_closed() {
+                return;
+            }
+            if pumped.hint.is_none() && !pumped.complete {
+                state.stats.errors.fetch_add(1, Ordering::Relaxed);
+                fail_turn(
+                    &state,
+                    &key,
+                    &session_id,
+                    cursor,
+                    &tx,
+                    ProxyError::new(
+                        "Backend stream ended before completion",
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "incomplete_response",
+                    ),
+                )
+                .await;
+                return;
+            }
 
             // Advance the cursor only on a turn that actually succeeded.
             //
@@ -1893,9 +1849,9 @@ async fn stream_response(
             // never existed and DeepSeek answered `{"code":26,"biz_msg":
             // "invalid message id"}`.
             let Some(hint) = pumped.hint.clone() else {
-                if let Some(mid) = pumped.parent {
-                    cursor = Some(mid);
-                }
+                // A completed answer without its own cursor must not certify
+                // the previous parent as the head of this new history.
+                cursor = pumped.parent;
                 break pumped;
             };
 
@@ -1920,7 +1876,7 @@ async fn stream_response(
                         hint = %hint,
                         "stale parent message id; rebuilding the session and replaying the transcript"
                     );
-                    match rebuild_session(&state, &key, &hint).await {
+                    match rebuild_session(&state, &conn, &key, &hint).await {
                         Ok(fresh) => {
                             let thinking = body.thinking_enabled;
                             let search = body.search_enabled;
@@ -1985,7 +1941,7 @@ async fn stream_response(
                     return;
                 }
                 context_recovered = true;
-                match rebuild_session(&state, &key, &hint).await {
+                match rebuild_session(&state, &conn, &key, &hint).await {
                     Ok(fresh) => {
                         let thinking = body.thinking_enabled;
                         let search = body.search_enabled;
@@ -2057,22 +2013,8 @@ async fn stream_response(
                     hint = %hint,
                     "retrying after backend throttle"
                 );
-                let conn = match state.pool.route_checked(&key).await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        fail_turn(
-                            &state,
-                            &key,
-                            &session_id,
-                            cursor,
-                            &tx,
-                            route_unavailable(e),
-                        )
-                        .await;
-                        return;
-                    }
-                };
-                conn.cool_down(std::time::Duration::from_secs_f64(wait)).await;
+                conn.cool_down(std::time::Duration::from_secs_f64(wait))
+                    .await;
             } else {
                 state.stats.errors.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(thread = %key, "upstream hint error: {hint}");
@@ -2082,16 +2024,30 @@ async fn stream_response(
                 } else {
                     CompletionError::Other(hint.clone())
                 };
-                fail_turn(&state, &key, &session_id, cursor, &tx, error_for(&state, &key, err).await)
-                    .await;
+                fail_turn(
+                    &state,
+                    &key,
+                    &session_id,
+                    cursor,
+                    &tx,
+                    error_for(&state, &key, err).await,
+                )
+                .await;
                 return;
             }
 
-            match completion_with_retry(&state, &key, &body).await {
+            match completion_with_retry(&state, &conn, &key, &body).await {
                 Ok(v) => next = Some(v),
                 Err(e) => {
-                    fail_turn(&state, &key, &session_id, cursor, &tx, error_for(&state, &key, e).await)
-                        .await;
+                    fail_turn(
+                        &state,
+                        &key,
+                        &session_id,
+                        cursor,
+                        &tx,
+                        error_for(&state, &key, e).await,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -2101,7 +2057,7 @@ async fn stream_response(
             parent,
             mut filter,
             text,
-            prose,
+            mut prose,
             prompt_tokens,
             ..
         } = pumped;
@@ -2170,6 +2126,9 @@ async fn stream_response(
             if !recovery.has_pending() {
                 break;
             }
+            if cursor.is_none() {
+                break;
+            }
             let prompt = recovery.begin_repair();
             let expected = recovery.expected;
             tracing::warn!(thread = %key, attempt, expected, "tool repair");
@@ -2181,35 +2140,43 @@ async fn stream_response(
                 parent_message_id: cursor,
                 exchanges: 0,
             };
-            let body = completion_body(
-                &turn_state,
-                &prompt,
-                false,
-                false,
-                &[],
-                &body.model_type,
-            );
-            let raw = match completion_with_retry(&state, &key, &body).await {
-                Ok((resp, _slot)) => match resp.text().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!("thread {key}: repair body failed: {e}");
-                        break;
-                    }
-                },
-                Err(e) => {
-                    tracing::error!("thread {key}: repair completion failed: {e}");
-                    break;
-                }
+            let body = completion_body(&turn_state, &prompt, false, false, &[], &body.model_type);
+            let budget = std::time::Duration::from_secs_f64(state.settings.request_timeout_secs)
+                .saturating_sub(started.elapsed());
+            let repair = async {
+                let (resp, _slot) = completion_with_retry(&state, &conn, &key, &body).await?;
+                // Keep the account slot until the correction body is drained.
+                resp.text()
+                    .await
+                    .map_err(|e| CompletionError::Other(e.to_string()))
             };
+            let raw = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = tokio::time::timeout(budget, repair) => match result {
+                    Ok(Ok(raw)) => raw,
+                    _ => break,
+                },
+            };
+            if first_hint(&raw).is_some()
+                || !raw.lines().any(|line| {
+                    let mut event = String::new();
+                    match protocol::classify_line(line, &mut event) {
+                        protocol::LineKind::Event(value) => is_upstream_finished(&value),
+                        _ => line.trim() == "data: [DONE]",
+                    }
+                })
+            {
+                break;
+            }
             let (_, repair_text, repair_mid) = route_all(&raw);
             // The correction answer is now the newest upstream message, so it —
             // not the malformed reply it fixed — becomes the parent of the
             // client's next turn. Saving `parent` here is what used to make
             // DeepSeek draw the next message as an edit of the broken answer.
-            if let Some(mid) = repair_mid {
-                cursor = Some(mid);
-            }
+            // Missing ids revoke cursor trust; never certify the prior answer
+            // as the head of a successful correction turn.
+            cursor = repair_mid;
             for event in dialect::scan(&repair_text) {
                 match recovery.accept(event) {
                     Ok(_) => {}
@@ -2251,6 +2218,7 @@ async fn stream_response(
 
         // Flush any held-back prose, then emit tool calls (if any).
         let tail = filter.finish();
+        prose.push_str(&tail);
         if !tail.is_empty() {
             let mut chunk = json!({
                 "id": id, "object": "chat.completion.chunk",
@@ -2260,7 +2228,13 @@ async fn stream_response(
             if include_usage {
                 chunk["usage"] = Value::Null;
             }
-            let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
+            if tx
+                .send(Ok(Event::default().data(chunk.to_string())))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
 
         let finish_reason = if filter.calls.is_empty() {
@@ -2287,7 +2261,13 @@ async fn stream_response(
             if include_usage {
                 chunk["usage"] = Value::Null;
             }
-            let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
+            if tx
+                .send(Ok(Event::default().data(chunk.to_string())))
+                .await
+                .is_err()
+            {
+                return;
+            }
             "tool_calls"
         };
 
@@ -2315,7 +2295,13 @@ async fn stream_response(
         if include_usage {
             done["usage"] = Value::Null;
         }
-        let _ = tx.send(Ok(Event::default().data(done.to_string()))).await;
+        if tx
+            .send(Ok(Event::default().data(done.to_string())))
+            .await
+            .is_err()
+        {
+            return;
+        }
         // With `include_usage`, OpenAI sends one last chunk with no choices and
         // the token counts, immediately before `[DONE]`.
         if include_usage {
@@ -2328,11 +2314,52 @@ async fn stream_response(
                 "choices": [],
                 "usage": usage
             });
-            let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
+            if tx
+                .send(Ok(Event::default().data(chunk.to_string())))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
-        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-
-        persist_cursor(&state.threads, &state.store, &key, &session_id, cursor);
+        // Commit before DONE: well-behaved clients close immediately after it.
+        // If the terminal send fails, revoke trust before releasing the lock.
+        if tx.is_closed() {
+            return;
+        }
+        if let Some(mid) = cursor {
+            let history = turn_history.completed(&prose, &filter.calls, &conn.email);
+            let resume = store::ThreadResume {
+                session_id: session_id.clone(),
+                parent_message_id: Some(mid.to_string()),
+            };
+            if let Err(e) = state.store.save_thread_checkpoint(&key, &resume, &history) {
+                tracing::error!(thread = %key, error = %e, "could not commit successful history checkpoint");
+                send_stream_error(
+                    &tx,
+                    ProxyError::new(
+                        "Could not save conversation state",
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "state_commit_failed",
+                    ),
+                )
+                .await;
+                return;
+            }
+            state.threads.lock().unwrap().insert(
+                key.clone(),
+                ThreadState {
+                    session_id,
+                    parent_message_id: Some(mid),
+                    exchanges: 0,
+                },
+            );
+        }
+        if tx.send(Ok(Event::default().data("[DONE]"))).await.is_err() {
+            if let Err(e) = state.store.clear_thread_history(&key) {
+                tracing::error!(thread = %key, error = %e, "could not invalidate interrupted history");
+            }
+        }
     });
 
     let mut response = Sse::new(ReceiverStream::new(rx)).into_response();
@@ -2411,7 +2438,10 @@ fn validate_request(req: &ChatRequest) -> Result<(), ProxyError> {
             _ => false,
         };
         if !ok {
-            return Err(invalid("tool_choice", "Input should be a valid tool choice"));
+            return Err(invalid(
+                "tool_choice",
+                "Input should be a valid tool choice",
+            ));
         }
     }
     for (i, m) in req.messages.iter().enumerate() {
@@ -2462,14 +2492,14 @@ fn validate_request(req: &ChatRequest) -> Result<(), ProxyError> {
         let Some(func) = tool.get("function") else {
             return Err(invalid("tools", "Invalid or unsupported tool schema"));
         };
-        let name = func.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+        let name = func
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default();
         if name.is_empty() || name.chars().count() > 128 {
             return Err(invalid("tools", "Invalid or unsupported tool schema"));
         }
-        let parameters = func
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let parameters = func.get("parameters").cloned().unwrap_or_else(|| json!({}));
         if !parameters.is_object() {
             return Err(invalid("tools", "Invalid or unsupported tool schema"));
         }
@@ -2483,8 +2513,12 @@ fn validate_request(req: &ChatRequest) -> Result<(), ProxyError> {
 }
 
 fn invalid(param: &str, message: &str) -> ProxyError {
-    ProxyError::new(message, axum::http::StatusCode::BAD_REQUEST, "invalid_request")
-        .with_param(param)
+    ProxyError::new(
+        message,
+        axum::http::StatusCode::BAD_REQUEST,
+        "invalid_request",
+    )
+    .with_param(param)
 }
 
 /// True when the schema contains a `$ref`/`$dynamicRef` that points outside the
@@ -2540,8 +2574,9 @@ fn queue_error(msg: &str) -> Response {
 
 fn route_unavailable(err: pool::RouteError) -> ProxyError {
     let retry_after = match err {
-        pool::RouteError::NoHealthyAccount { retry_after_ms } =>
-            retry_after_ms.map(|ms| ms.div_ceil(1000).max(1)),
+        pool::RouteError::NoHealthyAccount { retry_after_ms } => {
+            retry_after_ms.map(|ms| ms.div_ceil(1000).max(1))
+        }
     };
     tracing::warn!(error = %err, "no healthy account available");
     let mut response = ProxyError::new(
@@ -2660,7 +2695,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // base64, so the default rejects perfectly valid turns with
     // "Failed to buffer the request body: length limit exceeded". The cap is
     // derived from IMAGE_MAX_BYTES, not a magic number.
-    let body_limit = state.settings.image_max_bytes.saturating_mul(2).max(32 << 20);
+    let body_limit = state
+        .settings
+        .image_max_bytes
+        .saturating_mul(2)
+        .max(32 << 20);
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -3032,9 +3071,18 @@ mod tests {
         ));
         let prompt = recovery.begin_repair();
         assert!(prompt.contains("Schema(s) for the tool call(s) that failed:"));
-        assert!(prompt.contains("\"command\""), "schema must survive the dump");
-        assert!(prompt.contains("required"), "required must survive the dump");
-        assert!(!prompt.contains("\"search\""), "unfailed tools must not be dumped");
+        assert!(
+            prompt.contains("\"command\""),
+            "schema must survive the dump"
+        );
+        assert!(
+            prompt.contains("required"),
+            "required must survive the dump"
+        );
+        assert!(
+            !prompt.contains("\"search\""),
+            "unfailed tools must not be dumped"
+        );
     }
 
     #[test]
@@ -3047,9 +3095,11 @@ mod tests {
             (Some("bash".to_string()), "unterminated_block"),
         ] {
             let mut recovery = Recovery::new(specs.clone(), false, true);
-            recovery
-                .pending
-                .push(dialect::MalformedCall::new(name.clone(), String::new(), reason));
+            recovery.pending.push(dialect::MalformedCall::new(
+                name.clone(),
+                String::new(),
+                reason,
+            ));
             let prompt = recovery.begin_repair();
             assert!(
                 !prompt.contains("Schema(s) for the tool call(s) that failed:"),
@@ -3083,7 +3133,10 @@ mod tests {
                 prompt.contains("Schema(s) for the tool call(s) that failed:"),
                 "{text} must carry a schema"
             );
-            assert!(prompt.contains("\"command\""), "{text}: schema body missing");
+            assert!(
+                prompt.contains("\"command\""),
+                "{text}: schema body missing"
+            );
         }
     }
 
@@ -3119,17 +3172,11 @@ mod tests {
         );
 
         persist_cursor(&threads, &store, "t1", "s1", Some(101));
-        assert_eq!(
-            threads.lock().unwrap()["t1"].parent_message_id,
-            Some(101)
-        );
+        assert_eq!(threads.lock().unwrap()["t1"].parent_message_id, Some(101));
 
         // A later correction advances it again.
         persist_cursor(&threads, &store, "t1", "s1", Some(102));
-        assert_eq!(
-            threads.lock().unwrap()["t1"].parent_message_id,
-            Some(102)
-        );
+        assert_eq!(threads.lock().unwrap()["t1"].parent_message_id, Some(102));
         assert_eq!(
             store
                 .get_thread("t1")
@@ -3208,5 +3255,377 @@ mod tests {
         assert_eq!(resolve_upstream_model_type("deepseek-chat"), "default");
         assert_eq!(resolve_upstream_model_type("EXPERT"), "expert");
         assert_eq!(resolve_upstream_model_type("vision"), "vision");
+    }
+
+    #[test]
+    fn branch_history_distinguishes_continuation_regeneration_and_rewind() {
+        let first = request(vec![msg_with("user", "root")], vec![]);
+        let saved = TurnHistory::new(&first, "DEFAULT").completed("answer A", &[], "account-a");
+        let remote = ThreadState {
+            session_id: "remote-a".into(),
+            parent_message_id: Some(2),
+            exchanges: 0,
+        };
+        let second = request(
+            vec![
+                msg_with("user", "root"),
+                msg_with("assistant", "answer A"),
+                msg_with("user", "secret"),
+            ],
+            vec![],
+        );
+        assert!(TurnHistory::new(&second, "deepseek-chat").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "account-a"
+        ));
+        // Same prompt again is a regeneration, not a continuation below its answer.
+        assert!(!TurnHistory::new(&first, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "account-a"
+        ));
+        assert!(!TurnHistory::new(&second, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "account-b"
+        ));
+        assert!(!TurnHistory::new(&second, "DEFAULT").can_continue(
+            Some(&remote),
+            None,
+            "account-a"
+        ));
+        assert!(!TurnHistory::new(&second, "EXPERT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "account-a"
+        ));
+        let newer = TurnHistory::new(&second, "DEFAULT").completed("answer B", &[], "account-a");
+        let rewound = request(
+            vec![
+                msg_with("user", "root"),
+                msg_with("assistant", "answer A"),
+                msg_with("user", "different future"),
+            ],
+            vec![],
+        );
+        assert!(!TurnHistory::new(&rewound, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&newer),
+            "account-a"
+        ));
+        let edited = request(
+            vec![
+                msg_with("user", "changed root"),
+                msg_with("assistant", "answer A"),
+                msg_with("user", "secret"),
+            ],
+            vec![],
+        );
+        assert!(!TurnHistory::new(&edited, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "account-a"
+        ));
+    }
+
+    #[test]
+    fn branch_checkpoint_restores_without_an_in_memory_head() {
+        let store = store::Store::open_memory().unwrap();
+        let first = request(vec![msg_with("user", "root")], vec![]);
+        let saved = TurnHistory::new(&first, "DEFAULT").completed("answer", &[], "account-a");
+        store
+            .save_thread_checkpoint(
+                "thread",
+                &store::ThreadResume {
+                    session_id: "remote".into(),
+                    parent_message_id: Some("2".into()),
+                },
+                &saved,
+            )
+            .unwrap();
+        let resume = store.get_thread("thread").unwrap().unwrap();
+        let remote = ThreadState {
+            session_id: resume.session_id,
+            parent_message_id: resume.parent_message_id.and_then(|v| v.parse().ok()),
+            exchanges: 0,
+        };
+        let next = request(
+            vec![
+                msg_with("user", "root"),
+                msg_with("assistant", "answer"),
+                msg_with("user", "next"),
+            ],
+            vec![],
+        );
+        let history = TurnHistory::new(&next, "DEFAULT");
+        assert!(history.can_continue(
+            Some(&remote),
+            store.get_thread_history("thread").unwrap().as_ref(),
+            "account-a"
+        ));
+        store.clear_thread_history("thread").unwrap();
+        assert!(!history.can_continue(
+            Some(&remote),
+            store.get_thread_history("thread").unwrap().as_ref(),
+            "account-a"
+        ));
+    }
+
+    async fn branch_test_state() -> AppState {
+        let store = store::Store::open_memory().unwrap();
+        let pool = pool::Pool::connect(
+            vec![pool::AccountSpec {
+                email: "test@example.invalid".into(),
+                password: String::new(),
+                token: Some("local-test-token".into()),
+            }],
+            pool::PoolConfig::default(),
+            store.clone(),
+        )
+        .await
+        .unwrap();
+        AppState {
+            pool: Arc::new(pool),
+            store,
+            settings: Settings {
+                thinking_default: false,
+                search_enabled: false,
+                model_name: "DEFAULT".into(),
+                rate_limit_max_retries: 0,
+                rate_limit_backoff_secs: 0.5,
+                tool_repair_max_retries: 0,
+                request_timeout_secs: 2.0,
+                image_max_bytes: 1024,
+                heartbeat_interval_secs: 0.1,
+            },
+            threads: Arc::new(Mutex::new(HashMap::new())),
+            turns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            stats: Arc::new(Stats::new()),
+        }
+    }
+
+    async fn branch_test_stream(req: &ChatRequest, raw: &str) -> (AppState, Response) {
+        branch_test_stream_with_parent(req, raw, None).await
+    }
+
+    async fn branch_test_stream_with_parent(
+        req: &ChatRequest,
+        raw: &str,
+        parent_message_id: Option<i64>,
+    ) -> (AppState, Response) {
+        let state = branch_test_state().await;
+        let remote = ThreadState {
+            session_id: "test-remote".into(),
+            parent_message_id,
+            exchanges: 0,
+        };
+        state
+            .store
+            .save_thread(
+                "test-thread",
+                &store::ThreadResume {
+                    session_id: remote.session_id.clone(),
+                    parent_message_id: None,
+                },
+            )
+            .unwrap();
+        state
+            .threads
+            .lock()
+            .unwrap()
+            .insert("test-thread".into(), remote.clone());
+        let conn = state.pool.any();
+        let slot = conn.acquire().await.unwrap();
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(raw.to_string())
+                .unwrap(),
+        );
+        let turn = state.turn_guard("test-thread").await;
+        let (specs, required) = resolve_tools(req);
+        let response = stream_response(
+            turn,
+            state.clone(),
+            "test-thread".into(),
+            conn,
+            TurnHistory::new(req, "DEFAULT"),
+            resp,
+            slot,
+            completion_body(&remote, "test", false, false, &[], "DEFAULT"),
+            "test-completion".into(),
+            "DEFAULT".into(),
+            1,
+            "test".into(),
+            false,
+            true,
+            Instant::now(),
+            specs,
+            required,
+            true,
+        )
+        .await;
+        (state, response)
+    }
+
+    #[tokio::test]
+    async fn branch_stream_commits_actual_client_history() {
+        let req = request(vec![msg_with("user", "hello")], vec![]);
+        let raw = "data: {\"response_message_id\":2}\n\ndata: {\"v\":\"中文 answer\"}\n\ndata: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n";
+        let (state, response) = branch_test_stream(&req, raw).await;
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("中文 answer"));
+        assert_eq!(body.matches("data: [DONE]").count(), 1);
+        let saved = state
+            .store
+            .get_thread_history("test-thread")
+            .unwrap()
+            .unwrap();
+        let next = request(
+            vec![
+                msg_with("user", "hello"),
+                msg_with("assistant", "中文 answer"),
+                msg_with("user", "continue"),
+            ],
+            vec![],
+        );
+        let remote = state.threads.lock().unwrap()["test-thread"].clone();
+        assert!(TurnHistory::new(&next, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "test@example.invalid"
+        ));
+    }
+
+    #[tokio::test]
+    async fn branch_tool_checkpoint_accepts_client_id_rewrite() {
+        let req = request(vec![msg_with("user", "run")], vec![tool_with_schema()]);
+        let raw = "data: {\"response_message_id\":2}\n\ndata: {\"v\":\"<invoke name=\\\"bash\\\">{\\\"command\\\":\\\"whoami\\\"}</invoke>\"}\n\ndata: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n";
+        let (state, response) = branch_test_stream(&req, raw).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let sse = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(sse.matches("\"tool_calls\":[").count(), 1);
+        let mut assistant = msg_with("assistant", "");
+        assistant.tool_calls = vec![
+            json!({"id":"call_0|fc_call_0","type":"function","function":{"name":"bash","arguments":"{ \"command\": \"whoami\" }"}}),
+        ];
+        let mut result = msg_with("tool", "test-user");
+        result.tool_call_id = Some("call_0|fc_call_0".into());
+        let next = request(
+            vec![msg_with("user", "run"), assistant, result],
+            vec![tool_with_schema()],
+        );
+        let saved = state
+            .store
+            .get_thread_history("test-thread")
+            .unwrap()
+            .unwrap();
+        let remote = state.threads.lock().unwrap()["test-thread"].clone();
+        assert!(TurnHistory::new(&next, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "test@example.invalid"
+        ));
+    }
+
+    #[tokio::test]
+    async fn branch_partial_and_failed_streams_leave_no_trusted_head() {
+        let req = request(vec![msg_with("user", "hello")], vec![]);
+        for raw in [
+            "data: {\"response_message_id\":2}\n\ndata: {\"v\":\"partial\"}\n\n",
+            "event: hint\ndata: {\"type\":\"error\",\"content\":\"synthetic failure\"}\n\n",
+        ] {
+            let (state, response) = branch_test_stream(&req, raw).await;
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let sse = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(sse.contains("\"error\""));
+            assert_eq!(sse.matches("data: [DONE]").count(), 1);
+            assert!(state
+                .store
+                .get_thread_history("test-thread")
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_unexpected_upstream_body_is_redacted_before_error_logging() {
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(200)
+                .body("synthetic private model output")
+                .unwrap(),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let outcome = pump(
+            resp,
+            &tx,
+            "test-completion",
+            "DEFAULT",
+            1,
+            std::time::Duration::from_millis(100),
+            false,
+        )
+        .await;
+        assert!(!outcome.complete);
+        assert_eq!(outcome.hint.as_deref(), Some("non-SSE upstream response"));
+    }
+
+    #[tokio::test]
+    async fn branch_answer_without_new_cursor_cannot_certify_old_parent() {
+        let req = request(
+            vec![
+                msg_with("user", "root"),
+                msg_with("assistant", "previous answer"),
+                msg_with("user", "next"),
+            ],
+            vec![],
+        );
+        let raw = "data: {\"v\":\"new answer\"}\n\ndata: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n";
+        let (state, response) = branch_test_stream_with_parent(&req, raw, Some(7)).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let sse = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(sse.contains("new answer"));
+        assert!(!sse.contains("\"error\""));
+        assert_eq!(sse.matches("data: [DONE]").count(), 1);
+        assert!(state
+            .store
+            .get_thread_history("test-thread")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn branch_disconnected_client_leaves_no_trusted_head() {
+        let req = request(vec![msg_with("user", "hello")], vec![]);
+        let (state, response) =
+            branch_test_stream(&req, "data: {\"v\":\"answer\"}\n\ndata: [DONE]\n\n").await;
+        drop(response);
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.turn_guard("test-thread"),
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .store
+            .get_thread_history("test-thread")
+            .unwrap()
+            .is_none());
+        let conn = state.pool.any();
+        let _slot = conn.acquire().await.unwrap();
+        drop(guard);
     }
 }
