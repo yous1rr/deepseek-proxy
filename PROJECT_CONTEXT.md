@@ -4,12 +4,13 @@
 
 ## 项目定位
 
-这是一个 Rust workspace，实现面向 DeepSeek 私有 Web API 的 OpenAI 流式 Chat Completions 代理。当前接口范围明确限定为 `stream: true`，非流式 Chat Completions 不在支持范围内。
+这是一个 Rust workspace，实现面向 DeepSeek 私有 Web API 的 OpenAI 兼容代理。Chat Completions 的接口范围明确限定为 `stream: true`，非流式 Chat Completions 不在支持范围内；`/v1/responses` 另行提供按能力门控的 Responses 子集，支持流式与 collect 两种返回。
 
 主要入口和接口：
 
 - `deepseek-rs serve`：启动长期运行的 HTTP 服务。
 - `POST /v1/chat/completions`：仅支持 SSE 流式聊天补全。
+- `POST /v1/responses`、`GET`/`DELETE /v1/responses/{id}`：Responses 子集与已存响应的读取/删除，见下文“Responses 接入层”。
 - `GET /v1/models`：返回可用模型列表。
 - `GET /healthz`、`GET /readyz`：健康和就绪检查。
 - `GET /stats`：请求计数、线程、数据库和账号状态。
@@ -20,14 +21,16 @@
 
 ```text
 proxy → client → protocol → pow
+proxy → responses-core
 ```
 
-- `crates/proxy`：Axum HTTP 服务、请求校验、线程管理、工具调用、图片处理、账户池、SQLite、认证、重试和 CLI。
+- `crates/proxy`：Axum HTTP 服务、请求校验、线程管理、工具调用、图片处理、账户池、SQLite、认证、重试和 CLI；`src/responses/` 是 `/v1/responses` 的 HTTP/状态层与渠道适配器。
+- `crates/responses-core`：Responses 协议规则、能力模型、transcript 和事件编码，仅依赖 serde。
 - `crates/client`：DeepSeek 私有 API 客户端，负责登录、session、PoW、completion SSE 和图片上传。
 - `crates/protocol`：DeepSeek SSE 行解析和 fragment 路由。
 - `crates/pow`：DeepSeekHashV1 proof-of-work 实现和 nonce 搜索。
 - `corpus/`：从 DeepSeek completion 接口捕获的 SSE 测试样本，以及 Python 路由器生成的期望结果。
-- `tools/`：生成 corpus 期望结果、设备 ID 和分支黑盒验收的辅助脚本。
+- `tools/`：生成 corpus 期望结果、设备 ID 和分支黑盒验收的辅助脚本；`tools/upstream-capability-probe` 是独立的上游能力探测项目。
 
 关键入口：
 
@@ -227,15 +230,27 @@ cargo fmt --all -- --check
 - 隔离服务已停止，临时数据库和便携版 profile 已删除。原数据库的 SHA-256、大小和修改时间在验证前后完全一致。Pi Desktop 源码、安装版客户端及其 profile 未修改。
 - 便携版的真实 provider 请求证据与代理验收范围见 [PI_DESKTOP_BRANCH_VALIDATION.md](PI_DESKTOP_BRANCH_VALIDATION.md)。
 
+## Responses 接入层
+
+`/v1/responses` 是按能力门控的 OpenAI Responses 子集，与 Chat Completions 共享 DeepSeek turn 机制，但不修改其代码：
+
+- `crates/responses-core`（仅依赖 serde）负责协议规则、能力模型、transcript 和事件编码；`crates/proxy/src/responses/` 负责 HTTP、owner 隔离、存储、线程锁和渠道契约。
+- `deepseek_web` 适配器把 transcript 映射为 Chat 形状的 turn，复用历史指纹、固定账号、replay、限流重试和工具修复；只有流解码是本地实现。
+- 改变行为但对应能力未启用的参数一律返回 400 `unsupported_parameter`。`RESPONSES_CAPABILITY_PROFILE` 只能收窄能力，profile 无效时启动失败。
+- `store=true` 时在独立的 `responses` 表中按 owner 保存 transcript 副本；`store=false` 只保存与 Chat 相同的指纹 checkpoint。
+- 已在真实账号上验收：`tools/verify_responses.py` 首轮 68 项通过 64 项，失败均为某账号被上游持续限流后的 429；重启后重跑的 14 项、重启续接 2 项、key 隔离 9 项全部通过，原数据库不变。详见 [RESPONSES_ARCHITECTURE.md](RESPONSES_ARCHITECTURE.md) 的“真实账号验证”。
+
+分层、能力模型、DeepSeek 映射细节和接入新渠道的步骤见 [RESPONSES_ARCHITECTURE.md](RESPONSES_ARCHITECTURE.md)。上游能力探测工具见 [tools/upstream-capability-probe](tools/upstream-capability-probe/README.md)，AI 使用说明见 [skills/upstream-capability-probe/SKILL.md](skills/upstream-capability-probe/SKILL.md)。
+
 ## 功能拓展路线
 
-以下方向不包括非流式接口。前两项优先于新增接口，因为它们完善当前已公开的能力。
+以下方向针对 Chat Completions，不包括非流式 Chat 接口。前两项优先于新增接口，因为它们完善当前已公开的能力。
 
 1. **模型路由正确性**：`/v1/models` 已公开 `DEFAULT`、`EXPERT`、`VISION`，但当前 `CompletionBody::new()` 将 `model_type` 固定为 `default`，请求模型名没有映射到上游类型。应明确模型别名映射，为每种类型增加请求体单元测试，并用真实账号分别验证；在此之前不要承诺 `EXPERT`、`VISION` 已实际生效。
 2. **长会话生命周期与上下文管理**：增加显式 reset/delete/list 操作，协调清理 SQLite thread/binding 与进程内 thread/turn lock；为长会话增加可控的历史裁剪或摘要 replay，避免 context limit 后完整 transcript 仍超限。
 3. **账号池运维**：增加逐账号的 login/PoW 检查和健康结果；支持安全地热加载账号，减少新增或撤销账号必须重启服务的运维成本。当前 `check` 会连接账号池，但 PoW challenge 只针对 `pool.any()`。
 4. **按 API key 的配额与用量**：现有 key 表只负责 key 验证，统计是进程级计数。可扩展每 key 的请求/并发限额、令牌估算、错误率和周期用量，并提供可审计的 CLI 或受保护管理接口。
-5. **明确流式参数契约**：为支持的 OpenAI 请求字段建立白名单和能力说明。对 DeepSeek 上游确实支持的采样、停止条件或输出长度参数做映射与测试；其余字段应明确拒绝或说明忽略，避免客户端误以为设置已生效。
+5. **明确流式参数契约**：为支持的 OpenAI 请求字段建立白名单和能力说明。对 DeepSeek 上游确实支持的采样、停止条件或输出长度参数做映射与测试；其余字段应明确拒绝或说明忽略，避免客户端误以为设置已生效。`/v1/responses` 已按此原则实现能力门控，可作为 Chat Completions 改造的参考。
 6. **流式兼容性测试**：增加 Axum 路由级契约测试，覆盖 SSE headers、role/content/reasoning/tool_calls/usage chunk、错误事件、断开连接和 `[DONE]`；使用目标 SDK 做端到端兼容回归。
 7. **多模态扩展探索**：当前只接受 PNG/JPEG，且每轮仅发送第一张图片。可先确认 DeepSeek 上传接口对多图、PDF/文档或音频的真实支持与限制，再决定扩展格式和请求模型，避免仅在 OpenAI 请求层接受但上游无法处理。
 
@@ -243,3 +258,15 @@ cargo fmt --all -- --check
 
 `main.rs` 和 `dialect.rs` 顶部仍保留部分早期“尚未移植”的注释，但当前实现已经包含 SQLite 持久化、多账户池、工具 dialect、DSML 兼容和 correction turn。这些注释与实际代码不同步，后续维护时应以实现和测试为准，并可单独更新注释。
 六个拓展方向的详细源码调研、优先级和验收建议见 [EXTENSION_RESEARCH.md](EXTENSION_RESEARCH.md)。
+
+## v0.1.4 修复：工具调用 ID 重复导致会话重建
+
+`crates/proxy/src/main.rs` 曾按本轮序号生成工具调用 ID（`call_0`、`call_1`…），因此每一轮的第一个调用都叫 `call_0`。Pi Desktop 在每次请求前按调用 ID 去重（`tool-call-dedupe.ts`）：同一 ID 再次出现时，后一次调用及其结果会被整条删除。
+
+配合 v0.1.2 引入的历史指纹校验，被删除过的请求与已保存的历史对不上，被判定为分叉，于是每次调用工具都新建远程会话并回放历史；回放里同样看不到被删除的那一轮，模型误以为技能未加载而重复调用，形成循环。
+
+修复：工具调用 ID 改为全局唯一（`call_` + 24 位十六进制，由进程号、时间戳和原子计数器派生）。历史指纹按调用序数比较，不依赖 ID 字面值，因此续接判断不受影响。Responses 路径原本已使用唯一 ID。
+
+回归测试：`tool_call_ids_stay_unique_across_turns`（两轮流式工具调用产生不同 ID，且下一轮请求能续接保存的历史；撤掉修复后该测试失败）和 `tool_call_ids_never_repeat`。
+
+已知残留：Pi 连接自定义端点时不支持会话中途的 system 消息，技能或工具状态变化会改写首条 system 消息，代理在这些节点仍会新建会话并完整回放。上下文不丢失，也不会循环。

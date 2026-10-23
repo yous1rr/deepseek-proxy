@@ -20,6 +20,9 @@ curl http://127.0.0.1:9174/v1/chat/completions \
 - **OpenAI-compatible streaming** — `/v1/chat/completions` and `/v1/models`,
   with `tool_calls` deltas and usage accounting. `stream: true` is required;
   non-streaming JSON responses are not supported.
+- **Responses API** — a capability-gated `/v1/responses` subset with stored
+  `previous_response_id` chains; unsupported parameters are rejected, never
+  silently ignored. See [Responses API](#responses-api).
 - **Tool calling** — JSON-Schema validated arguments, and a bounded repair turn
   when the model emits a malformed call instead of surfacing the error.
 - **Branch-aware sessions** — resume matching histories with a delta; replay the
@@ -93,7 +96,8 @@ Frequently used environment overrides: `PROXY_HOST`, `PROXY_PORT`, `DB_PATH`,
 `CONFIG_PATH`, `DEEPSEEK_RUNTIME_DIR`, `MODEL_NAME`, `THINKING_ENABLED`,
 `SEARCH_ENABLED`, `REQUEST_DELAY`, `MAX_INFLIGHT_PER_ACCOUNT`, `QUEUE_LIMIT`,
 `QUEUE_TIMEOUT`, `REQUEST_TIMEOUT`, `HEARTBEAT_INTERVAL`, `IMAGE_MAX_BYTES`,
-`RATE_LIMIT_MAX_RETRIES`, `RATE_LIMIT_BACKOFF_S`, `TOOL_REPAIR_MAX_RETRIES`.
+`RATE_LIMIT_MAX_RETRIES`, `RATE_LIMIT_BACKOFF_S`, `TOOL_REPAIR_MAX_RETRIES`,
+`RESPONSES_CAPABILITY_PROFILE`.
 
 Credentials never go in `config.toml`.
 
@@ -151,6 +155,9 @@ closing before exposing the port.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/chat/completions` | Streaming completions (`stream: true`) |
+| `POST` | `/v1/responses` | Responses API subset, streaming or collected |
+| `GET` | `/v1/responses/{id}` | Retrieve a stored response |
+| `DELETE` | `/v1/responses/{id}` | Delete a stored response |
 | `GET` | `/v1/models` | Advertised model ids |
 | `GET` | `/healthz` | Liveness |
 | `GET` | `/readyz` | Readiness |
@@ -170,6 +177,36 @@ closing before exposing the port.
 With the server down, `stats` falls back to database counts and says so on
 stderr.
 
+## Responses API
+
+`/v1/responses` serves a capability-gated subset of the OpenAI Responses API:
+text and image input, function tools with `tool_choice`, reasoning, verbosity,
+streaming and collected responses, stored responses with
+`previous_response_id` chains, and retrieve/delete. Every request parameter
+that would change behavior must map to an enabled capability; anything else
+(sampling controls, `max_output_tokens`, hosted tools, structured output,
+`background`, …) is rejected with `400 unsupported_parameter` instead of being
+silently ignored.
+
+```bash
+curl http://127.0.0.1:9174/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","input":"hello","stream":true}'
+```
+
+Stored responses are scoped to the caller's API key. Without registered keys
+every caller shares one owner, so register a key before exposing the port.
+`RESPONSES_CAPABILITY_PROFILE=PATH` narrows the enabled capabilities with a
+profile, for example one produced by
+[`tools/upstream-capability-probe`](tools/upstream-capability-probe/README.md);
+a malformed or mismatched profile stops startup. Layering, the capability
+model and how to add another upstream channel are described in
+[RESPONSES_ARCHITECTURE.md](RESPONSES_ARCHITECTURE.md).
+
+`tools/verify_responses.py` is the matching synthetic live verifier. Run it
+against an isolated loopback proxy that serves a database copy; it reads that
+copy with read-only connections (except the `keys` command, which needs
+`--confirm-temporary-db`) and prints only checks and statuses.
 ## CLI
 
 ```
@@ -272,14 +309,16 @@ See [the implementation plan](BRANCH_IMPLEMENTATION_PLAN.md) and
 ## Architecture
 
 ```
-crates/pow       DeepSeekHashV1 + multithreaded nonce search
-crates/protocol  SSE parsing + fragment routing + OpenAI chunk shaping
-crates/client    login, session, PoW header, streaming, image upload
-crates/proxy     axum server, tool dialect, SQLite storage, auth, retry
-corpus/          captured SSE streams used as test fixtures
+crates/pow            DeepSeekHashV1 + multithreaded nonce search
+crates/protocol       SSE parsing + fragment routing + OpenAI chunk shaping
+crates/client         login, session, PoW header, streaming, image upload
+crates/responses-core Responses protocol rules, capabilities, events (serde only)
+crates/proxy          axum server, tool dialect, SQLite storage, auth, retry
+corpus/               captured SSE streams used as test fixtures
 ```
 
-Dependencies point strictly downward: `proxy` → `client` → `protocol` → `pow`.
+Dependencies point strictly downward: `proxy` → `client` → `protocol` → `pow`,
+and `proxy` → `responses-core`, which knows nothing about channels or HTTP.
 Nothing below `proxy` knows about HTTP serving.
 
 ## DeepSeekHashV1
