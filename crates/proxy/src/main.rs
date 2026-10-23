@@ -24,6 +24,7 @@ mod history;
 mod images;
 mod log;
 mod pool;
+mod responses;
 mod store;
 
 use axum::{
@@ -89,6 +90,7 @@ struct AppState {
     /// same parent id, and whichever finished last would orphan the other's
     /// message, which DeepSeek renders as an edit.
     turns: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    responses: responses::Runtime,
     store: store::Store,
     stats: Arc<Stats>,
 }
@@ -2743,12 +2745,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "settings loaded"
     );
 
+    // A missing, malformed or mismatched capability profile is a startup
+    // error: silently falling back could enable features the operator meant
+    // to disable.
+    let responses = responses::Runtime::load(
+        Arc::new(responses::deepseek::DeepSeekWeb),
+        std::env::var_os("RESPONSES_CAPABILITY_PROFILE").map(std::path::PathBuf::from),
+    )?;
+
     let state = AppState {
         pool,
         settings,
         threads: Arc::new(Mutex::new(HashMap::new())),
         turns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         store,
+        responses,
         stats: Arc::new(Stats::new()),
     };
 
@@ -2769,6 +2780,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/stats", get(stats))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses::create))
+        .route(
+            "/v1/responses/{response_id}",
+            get(responses::retrieve).delete(responses::delete),
+        )
         .with_state(state)
         // Must come AFTER the routes: `Router::layer` only wraps routes that
         // already exist, so placing it earlier silently does nothing.
@@ -3484,6 +3500,9 @@ mod tests {
             },
             threads: Arc::new(Mutex::new(HashMap::new())),
             turns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            responses: responses::Runtime::new(Arc::new(responses::deepseek::DeepSeekWeb), None)
+                .unwrap()
+                .0,
             stats: Arc::new(Stats::new()),
         }
     }

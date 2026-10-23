@@ -1105,6 +1105,7 @@ dependencies = [
  "pow",
  "protocol",
  "reqwest",
+ "responses-core",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1337,6 +1338,14 @@ dependencies = [
  "wasm-streams",
  "web-sys",
  "webpki-roots",
+]
+
+[[package]]
+name = "responses-core"
+version = "0.1.2"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

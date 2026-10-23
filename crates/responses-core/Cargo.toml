@@ -1,0 +1,10 @@
+[package]
+name = "responses-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Channel-independent engine for the OpenAI Responses protocol: capability negotiation, request planning, neutral transcripts and stream event encoding."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

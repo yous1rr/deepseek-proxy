@@ -50,6 +50,19 @@ pub struct AccountRow {
     pub created_at: i64,
 }
 
+/// One persisted Responses resource, scoped to a caller identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseRecord {
+    pub response_id: String,
+    pub owner_id: String,
+    pub previous_response_id: Option<String>,
+    pub thread_id: String,
+    pub model: String,
+    pub status: String,
+    pub response_json: String,
+    pub transcript_json: String,
+}
+
 /// One registered API key (only its hash is stored).
 #[derive(Debug, Clone)]
 pub struct ApiKeyRow {
@@ -140,7 +153,24 @@ impl Store {
                  account_email TEXT NOT NULL,
                  message_count INTEGER NOT NULL,
                  updated_at    INTEGER NOT NULL
-             );",
+             );
+             -- Responses resources are separate from chat checkpoints so the
+             -- existing Chat Completions persistence contract stays unchanged.
+             -- Each row carries its full transcript, so deleting a parent
+             -- never breaks a child; previous_response_id is informational.
+             CREATE TABLE IF NOT EXISTS responses (
+                 response_id TEXT PRIMARY KEY,
+                 owner_id TEXT NOT NULL,
+                 previous_response_id TEXT,
+                 thread_id TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 response_json TEXT NOT NULL,
+                 transcript_json TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS responses_owner_created
+                 ON responses(owner_id, created_at DESC);",
         )?;
         Ok(())
     }
@@ -423,6 +453,127 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically save a Responses resource and its completed thread head.
+    pub fn save_response_checkpoint(
+        &self,
+        thread_id: &str,
+        resume: &ThreadResume,
+        history: &ThreadHistory,
+        record: &ResponseRecord,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO threads (thread_id, session_id, parent_message_id, updated_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 session_id = excluded.session_id,
+                 parent_message_id = excluded.parent_message_id,
+                 updated_at = excluded.updated_at",
+            params![thread_id, resume.session_id, resume.parent_message_id],
+        )?;
+        tx.execute(
+            "INSERT INTO thread_bindings (thread_id, email, updated_at)
+             VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 email = excluded.email, updated_at = excluded.updated_at",
+            params![thread_id, history.account_email],
+        )?;
+        tx.execute(
+            "INSERT INTO thread_history
+                 (thread_id, fingerprint, account_email, message_count, updated_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 fingerprint = excluded.fingerprint,
+                 account_email = excluded.account_email,
+                 message_count = excluded.message_count,
+                 updated_at = excluded.updated_at",
+            params![
+                thread_id,
+                history.fingerprint,
+                history.account_email,
+                history.message_count
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO responses
+                 (response_id, owner_id, previous_response_id, thread_id, model, status,
+                  response_json, transcript_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())",
+            params![
+                record.response_id,
+                record.owner_id,
+                record.previous_response_id,
+                record.thread_id,
+                record.model,
+                record.status,
+                record.response_json,
+                record.transcript_json,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Save a response resource when the upstream did not expose a new cursor.
+    /// The resource remains retrievable, but it is not trusted as a thread head.
+    pub fn save_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        conn.execute(
+            "INSERT INTO responses
+                 (response_id, owner_id, previous_response_id, thread_id, model, status,
+                  response_json, transcript_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())",
+            params![
+                record.response_id,
+                record.owner_id,
+                record.previous_response_id,
+                record.thread_id,
+                record.model,
+                record.status,
+                record.response_json,
+                record.transcript_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_response(
+        &self,
+        response_id: &str,
+        owner_id: &str,
+    ) -> Result<Option<ResponseRecord>, StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT response_id, owner_id, previous_response_id, thread_id, model, status,
+                        response_json, transcript_json
+                 FROM responses WHERE response_id = ?1 AND owner_id = ?2",
+                params![response_id, owner_id],
+                |row| {
+                    Ok(ResponseRecord {
+                        response_id: row.get(0)?,
+                        owner_id: row.get(1)?,
+                        previous_response_id: row.get(2)?,
+                        thread_id: row.get(3)?,
+                        model: row.get(4)?,
+                        status: row.get(5)?,
+                        response_json: row.get(6)?,
+                        transcript_json: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn delete_response(&self, response_id: &str, owner_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        Ok(conn.execute(
+            "DELETE FROM responses WHERE response_id = ?1 AND owner_id = ?2",
+            params![response_id, owner_id],
+        )? > 0)
+    }
+
     /// Drop a thread, its account binding and its history marker in one
     /// transaction, so a deleted thread can never leave an orphan binding or
     /// trusted fingerprint behind. Deleting an unknown thread is a no-op.
@@ -477,6 +628,23 @@ impl Store {
             )
             .optional()?;
         Ok(hit.is_some())
+    }
+    /// Return the stable owner id for a valid bearer key. Open installations
+    /// use one anonymous owner, while configured keys are isolated by id.
+    pub fn api_key_owner(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))?;
+        if count == 0 {
+            return Ok(Some("anonymous".into()));
+        }
+        let hash = hash_key(key);
+        Ok(conn
+            .query_row(
+                "SELECT id FROM api_keys WHERE key_hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 }
 
@@ -885,5 +1053,139 @@ mod tests {
                 "updated_at",
             ]
         );
+    }
+
+    fn response(id: &str, owner: &str, previous: Option<&str>) -> ResponseRecord {
+        ResponseRecord {
+            response_id: id.into(),
+            owner_id: owner.into(),
+            previous_response_id: previous.map(str::to_string),
+            thread_id: "thread-r".into(),
+            model: "DEFAULT".into(),
+            status: "completed".into(),
+            response_json: format!("{{\"id\":\"{id}\"}}"),
+            transcript_json: "[]".into(),
+        }
+    }
+
+    #[test]
+    fn responses_round_trip_and_stay_owner_scoped() {
+        let s = Store::open_memory().unwrap();
+        let first = response("resp_1", "owner-a", None);
+        s.save_response(&first).unwrap();
+        assert_eq!(s.get_response("resp_1", "owner-a").unwrap(), Some(first));
+        assert_eq!(s.get_response("resp_1", "owner-b").unwrap(), None);
+        assert!(!s.delete_response("resp_1", "owner-b").unwrap());
+        assert!(s.get_response("resp_1", "owner-a").unwrap().is_some());
+
+        // A child keeps its own transcript copy, so deleting the parent
+        // never breaks it.
+        s.save_response(&response("resp_2", "owner-a", Some("resp_1")))
+            .unwrap();
+        assert!(s.delete_response("resp_1", "owner-a").unwrap());
+        assert!(!s.delete_response("resp_1", "owner-a").unwrap());
+        assert_eq!(
+            s.get_response("resp_2", "owner-a")
+                .unwrap()
+                .unwrap()
+                .previous_response_id
+                .as_deref(),
+            Some("resp_1")
+        );
+    }
+
+    #[test]
+    fn response_checkpoint_is_atomic() {
+        let s = Store::open_memory().unwrap();
+        let record = response("resp_1", "owner-a", None);
+        s.save_response_checkpoint(
+            "thread-r",
+            &resume("sess-1", Some("5")),
+            &history("fp-1", "a@b", 2),
+            &record,
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_thread("thread-r").unwrap(),
+            Some(resume("sess-1", Some("5")))
+        );
+        assert_eq!(s.get_binding("thread-r").unwrap().as_deref(), Some("a@b"));
+        assert_eq!(
+            s.get_thread_history("thread-r").unwrap(),
+            Some(history("fp-1", "a@b", 2))
+        );
+
+        // A duplicate response id fails the insert, and nothing else moves.
+        assert!(s
+            .save_response_checkpoint(
+                "thread-r",
+                &resume("sess-2", Some("9")),
+                &history("fp-2", "c@d", 4),
+                &record,
+            )
+            .is_err());
+        assert_eq!(
+            s.get_thread("thread-r").unwrap(),
+            Some(resume("sess-1", Some("5")))
+        );
+        assert_eq!(s.get_binding("thread-r").unwrap().as_deref(), Some("a@b"));
+        assert_eq!(
+            s.get_thread_history("thread-r").unwrap(),
+            Some(history("fp-1", "a@b", 2))
+        );
+    }
+
+    #[test]
+    fn legacy_databases_gain_the_responses_table() {
+        let path = std::env::temp_dir().join(format!(
+            "deepseek-proxy-responses-migration-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE threads (
+                     thread_id         TEXT PRIMARY KEY,
+                     session_id        TEXT NOT NULL,
+                     parent_message_id TEXT,
+                     updated_at        INTEGER NOT NULL
+                 );
+                 INSERT INTO threads VALUES ('legacy', 'sess-legacy', '7', 1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open_path(&path).unwrap();
+        assert_eq!(
+            s.get_thread("legacy").unwrap(),
+            Some(resume("sess-legacy", Some("7")))
+        );
+        s.save_response(&response("resp_1", "anonymous", None))
+            .unwrap();
+        drop(s);
+        let reopened = Store::open_path(&path).unwrap();
+        assert!(reopened
+            .get_response("resp_1", "anonymous")
+            .unwrap()
+            .is_some());
+        drop(reopened);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn api_key_owner_is_the_key_id_never_the_secret() {
+        let s = Store::open_memory().unwrap();
+        assert_eq!(s.api_key_owner("").unwrap().as_deref(), Some("anonymous"));
+        s.insert_api_key("team", "sk-team-secret").unwrap();
+        let owner = s.api_key_owner("sk-team-secret").unwrap().unwrap();
+        assert!(owner.starts_with("key-"));
+        assert!(!owner.contains("secret"));
+        assert_eq!(s.api_key_owner("sk-other").unwrap(), None);
+        assert_eq!(s.api_key_owner("").unwrap(), None);
     }
 }
