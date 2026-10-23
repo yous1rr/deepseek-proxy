@@ -2310,7 +2310,7 @@ async fn stream_response(
                 .map(|(i, c)| {
                     json!({
                         "index": i,
-                        "id": format!("call_{i}"),
+                        "id": tool_call_id(),
                         "type": "function",
                         "function": { "name": c.name, "arguments": c.arguments }
                     })
@@ -2459,6 +2459,25 @@ fn uuid_like() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{n:x}")
+}
+
+/// Unique OpenAI tool-call id for an emitted call.
+///
+/// Ids must be unique across the whole conversation, not just within a turn.
+/// Clients such as Pi Desktop deduplicate transcripts by tool-call id: the old
+/// per-turn `call_{index}` scheme reused `call_0` every turn, so they dropped
+/// each later round, the history diverged from the saved head, and the proxy
+/// opened a fresh remote session on every tool call.
+fn tool_call_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let seed = format!(
+        "{}:{}:{}",
+        std::process::id(),
+        uuid_like(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    let digest = hex::encode(Sha256::digest(seed.as_bytes()));
+    format!("call_{}", &digest[..24])
 }
 
 fn unix_secs() -> u64 {
@@ -3636,6 +3655,128 @@ mod tests {
             Some(&saved),
             "test@example.invalid"
         ));
+    }
+
+    /// Tool-call ids the stream emitted, in order.
+    fn emitted_tool_call_ids(sse: &str) -> Vec<String> {
+        sse.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"]["tool_calls"]
+                    .as_array()
+                    .cloned()
+            })
+            .flatten()
+            .filter_map(|call| call["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Upstream reply that calls `bash` once with `command`.
+    fn bash_call_reply(command: &str) -> String {
+        let block = format!(
+            "<invoke name=\"bash\">{}</invoke>",
+            json!({ "command": command })
+        );
+        let events = [
+            json!({ "response_message_id": 2 }),
+            json!({ "v": block }),
+            json!({ "p": "response/status", "v": "FINISHED" }),
+        ];
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    fn assistant_call(id: &str, command: &str) -> Msg {
+        let mut assistant = msg_with("assistant", "");
+        assistant.tool_calls = vec![json!({
+            "id": id,
+            "type": "function",
+            "function": {"name": "bash", "arguments": json!({ "command": command }).to_string()}
+        })];
+        assistant
+    }
+
+    fn tool_result(id: &str, output: &str) -> Msg {
+        let mut result = msg_with("tool", output);
+        result.tool_call_id = Some(id.into());
+        result
+    }
+
+    async fn sse_body(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Pi Desktop drops every later tool call and result whose id repeats an
+    /// earlier one in the transcript. Per-turn ids (`call_0` every turn) made
+    /// it delete each round after the first, so the next request diverged from
+    /// the saved history, a new remote session was opened on every tool call,
+    /// and the model re-issued calls it could no longer see.
+    #[tokio::test]
+    async fn tool_call_ids_stay_unique_across_turns() {
+        let tools = vec![tool_with_schema()];
+        let first = request(vec![msg_with("user", "run")], tools.clone());
+        let (_, response) = branch_test_stream(&first, &bash_call_reply("whoami")).await;
+        let first_sse = sse_body(response).await;
+        let first_ids = emitted_tool_call_ids(&first_sse);
+        assert_eq!(first_ids.len(), 1);
+
+        let second = request(
+            vec![
+                msg_with("user", "run"),
+                assistant_call(&first_ids[0], "whoami"),
+                tool_result(&first_ids[0], "test-user"),
+            ],
+            tools.clone(),
+        );
+        let (state, response) = branch_test_stream(&second, &bash_call_reply("hostname")).await;
+        let second_ids = emitted_tool_call_ids(&sse_body(response).await);
+        assert_eq!(second_ids.len(), 1);
+        assert_ne!(first_ids[0], second_ids[0], "every turn needs a fresh id");
+        for id in first_ids.iter().chain(&second_ids) {
+            assert!(id.starts_with("call_") && id.len() <= 40, "{id}");
+        }
+
+        let saved = state
+            .store
+            .get_thread_history("test-thread")
+            .unwrap()
+            .unwrap();
+        let remote = state.threads.lock().unwrap()["test-thread"].clone();
+        // With both rounds kept, the next request extends the saved head.
+        let both_rounds = vec![
+            msg_with("user", "run"),
+            assistant_call(&first_ids[0], "whoami"),
+            tool_result(&first_ids[0], "test-user"),
+            assistant_call(&second_ids[0], "hostname"),
+            tool_result(&second_ids[0], "test-host"),
+        ];
+        let next = request(both_rounds, tools.clone());
+        assert!(TurnHistory::new(&next, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "test@example.invalid"
+        ));
+        // The transcript a colliding id produced: the second round deleted.
+        assert!(!TurnHistory::new(&second, "DEFAULT").can_continue(
+            Some(&remote),
+            Some(&saved),
+            "test@example.invalid"
+        ));
+    }
+
+    #[test]
+    fn tool_call_ids_never_repeat() {
+        let ids: std::collections::HashSet<String> = (0..10_000).map(|_| tool_call_id()).collect();
+        assert_eq!(ids.len(), 10_000);
+        assert!(ids
+            .iter()
+            .all(|id| id.starts_with("call_") && id.len() <= 40));
     }
 
     #[tokio::test]

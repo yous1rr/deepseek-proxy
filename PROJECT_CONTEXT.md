@@ -258,3 +258,15 @@ cargo fmt --all -- --check
 
 `main.rs` 和 `dialect.rs` 顶部仍保留部分早期“尚未移植”的注释，但当前实现已经包含 SQLite 持久化、多账户池、工具 dialect、DSML 兼容和 correction turn。这些注释与实际代码不同步，后续维护时应以实现和测试为准，并可单独更新注释。
 六个拓展方向的详细源码调研、优先级和验收建议见 [EXTENSION_RESEARCH.md](EXTENSION_RESEARCH.md)。
+
+## v0.1.4 修复：工具调用 ID 重复导致会话重建
+
+`crates/proxy/src/main.rs` 曾按本轮序号生成工具调用 ID（`call_0`、`call_1`…），因此每一轮的第一个调用都叫 `call_0`。Pi Desktop 在每次请求前按调用 ID 去重（`tool-call-dedupe.ts`）：同一 ID 再次出现时，后一次调用及其结果会被整条删除。
+
+配合 v0.1.2 引入的历史指纹校验，被删除过的请求与已保存的历史对不上，被判定为分叉，于是每次调用工具都新建远程会话并回放历史；回放里同样看不到被删除的那一轮，模型误以为技能未加载而重复调用，形成循环。
+
+修复：工具调用 ID 改为全局唯一（`call_` + 24 位十六进制，由进程号、时间戳和原子计数器派生）。历史指纹按调用序数比较，不依赖 ID 字面值，因此续接判断不受影响。Responses 路径原本已使用唯一 ID。
+
+回归测试：`tool_call_ids_stay_unique_across_turns`（两轮流式工具调用产生不同 ID，且下一轮请求能续接保存的历史；撤掉修复后该测试失败）和 `tool_call_ids_never_repeat`。
+
+已知残留：Pi 连接自定义端点时不支持会话中途的 system 消息，技能或工具状态变化会改写首条 system 消息，代理在这些节点仍会新建会话并完整回放。上下文不丢失，也不会循环。
