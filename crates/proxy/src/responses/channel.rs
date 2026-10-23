@@ -74,6 +74,10 @@ pub struct TurnOutcome {
     /// `None` when the upstream exposed no resumable cursor; the next turn
     /// then replays the transcript.
     pub checkpoint: Option<Checkpoint>,
+    /// `Some(reason)` when the channel stopped at its output budget instead of
+    /// letting the model finish. The reason is reported verbatim as
+    /// `incomplete_details.reason`.
+    pub truncated: Option<String>,
 }
 
 /// Why a turn did not produce an outcome.

@@ -47,7 +47,7 @@ pub struct DeepSeekWeb;
 /// everything it does not.
 pub fn ceiling() -> CapabilitySet {
     use Capability as C;
-    let supported: [(Capability, Provider, &str); 10] = [
+    let supported: [(Capability, Provider, &str); 11] = [
         (C::Text, Provider::Upstream, "flattened_prompt"),
         (C::Streaming, Provider::Proxy, "upstream_sse_reencoded"),
         (C::NonStreaming, Provider::Proxy, "collected_stream"),
@@ -56,6 +56,9 @@ pub fn ceiling() -> CapabilitySet {
         (C::ToolChoice, Provider::Proxy, "prompted_directive"),
         (C::Reasoning, Provider::Upstream, "thinking_toggle"),
         (C::Verbosity, Provider::Proxy, "prompted_directive"),
+        // The upstream has no such parameter; the proxy stops forwarding at
+        // the budget and reports `incomplete_details.reason=max_output_tokens`.
+        (C::MaxOutputTokens, Provider::Proxy, "local_token_budget"),
         (C::StoredResponses, Provider::Proxy, "local_transcript"),
         (
             C::PreviousResponse,
@@ -63,7 +66,7 @@ pub fn ceiling() -> CapabilitySet {
             "local_transcript_replay",
         ),
     ];
-    let unsupported: [(Capability, &str); 20] = [
+    let unsupported: [(Capability, &str); 19] = [
         (C::FileInput, "no_upstream_file_input"),
         (C::CustomTools, "no_custom_tool_grammar"),
         (C::WebSearch, "hosted_tool_not_implemented"),
@@ -75,7 +78,6 @@ pub fn ceiling() -> CapabilitySet {
         (C::Shell, "hosted_tool_not_implemented"),
         (C::StructuredOutput, "no_upstream_schema_enforcement"),
         (C::SamplingControls, "no_upstream_sampling_parameters"),
-        (C::MaxOutputTokens, "no_upstream_output_limit"),
         (C::Logprobs, "no_upstream_logprobs"),
         (C::Conversations, "not_implemented"),
         (C::Background, "not_implemented"),
@@ -437,32 +439,39 @@ async fn run(
     let mut context_recovered = false;
     let mut cursor_recovered = false;
     let mut announced = false;
+    // The upstream cannot enforce an output limit, so `drain` stops forwarding
+    // once this many tokens (reasoning included) have been produced.
+    let output_budget = turn
+        .max_output_tokens
+        .and_then(|limit| u64::try_from(limit).ok());
 
     let drained = loop {
         let (resp, slot) = next.take().expect("attempt in flight");
         let budget = limit.saturating_sub(started.elapsed());
-        let drained = match tokio::time::timeout(budget, drain(resp, &events, &mut announced)).await
-        {
-            Ok(drained) => drained,
-            Err(_) => {
-                tracing::error!(
-                    thread = %key,
-                    timeout_s = state.settings.request_timeout_secs,
-                    "turn timed out waiting for upstream"
-                );
-                return Err(fail_with_cursor(
-                    &state,
-                    &key,
-                    &session_id,
-                    cursor,
-                    ProxyError::new(
-                        "Request processing timed out",
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "request_timeout",
-                    ),
-                ));
-            }
-        };
+        let drained =
+            match tokio::time::timeout(budget, drain(resp, &events, &mut announced, output_budget))
+                .await
+            {
+                Ok(drained) => drained,
+                Err(_) => {
+                    tracing::error!(
+                        thread = %key,
+                        timeout_s = state.settings.request_timeout_secs,
+                        "turn timed out waiting for upstream"
+                    );
+                    return Err(fail_with_cursor(
+                        &state,
+                        &key,
+                        &session_id,
+                        cursor,
+                        ProxyError::new(
+                            "Request processing timed out",
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "request_timeout",
+                        ),
+                    ));
+                }
+            };
         if drained.cancelled {
             return Err(TurnError::Cancelled);
         }
@@ -625,6 +634,7 @@ async fn run(
         mut prose,
         reasoning,
         prompt_tokens,
+        truncated,
         ..
     } = drained;
 
@@ -650,14 +660,18 @@ async fn run(
 
     // Validate every call against its schema and run correction turns,
     // chained below the newest upstream message.
+    // A truncated turn never executes tool calls: the budget may have cut the
+    // block mid-arguments, and a half-parsed call would be worse than none.
     filter.calls.clear();
     let mut recovery = Recovery::new(specs, required, turn.parallel_tool_calls);
-    for event in dialect::scan(&text) {
-        if let Err(error) = recovery.accept(event) {
-            return Err(fail_with_cursor(&state, &key, &session_id, cursor, error));
+    if !truncated {
+        for event in dialect::scan(&text) {
+            if let Err(error) = recovery.accept(event) {
+                return Err(fail_with_cursor(&state, &key, &session_id, cursor, error));
+            }
         }
+        recovery.require_call();
     }
-    recovery.require_call();
     for repair_attempt in 1..=state.settings.tool_repair_max_retries {
         if !recovery.has_pending() || cursor.is_none() {
             break;
@@ -765,10 +779,12 @@ async fn run(
             arguments: call.arguments,
         })
         .collect();
+    let truncated = truncated.then(|| "max_output_tokens".to_string());
     tracing::info!(
         thread = %key,
         tool_calls = calls.len(),
         trusted_head = checkpoint.is_some(),
+        truncated = truncated.is_some(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "responses turn done"
     );
@@ -776,6 +792,7 @@ async fn run(
         calls,
         usage,
         checkpoint,
+        truncated,
     })
 }
 
@@ -809,6 +826,43 @@ struct Drained {
     prose: String,
     reasoning: String,
     prompt_tokens: u64,
+    /// Set once the output budget is exhausted; later text is not forwarded.
+    truncated: bool,
+}
+
+/// Output budget in tokens, counting reasoning the way OpenAI does.
+///
+/// `None` means the turn is unbounded.
+fn over_budget(prose: &str, reasoning: &str, budget: Option<u64>) -> bool {
+    match budget {
+        None => false,
+        Some(limit) => estimate_tokens(prose) + estimate_tokens(reasoning) >= limit,
+    }
+}
+
+/// Longest prefix of `text` whose estimate fits in `tokens`.
+///
+/// Cutting by characters would overshoot for dense scripts, so the prefix is
+/// found with the same estimator the budget check uses.
+fn trim_to_tokens(text: &str, tokens: u64) -> String {
+    if tokens == 0 || text.is_empty() {
+        return String::new();
+    }
+    if estimate_tokens(text) <= tokens {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut low, mut high) = (0usize, chars.len());
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect();
+        if estimate_tokens(&candidate) <= tokens {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    chars[..low].iter().collect()
 }
 
 /// Read one upstream response, forwarding answer and reasoning text.
@@ -821,6 +875,7 @@ async fn drain(
     resp: reqwest::Response,
     events: &mpsc::Sender<TurnEvent>,
     announced: &mut bool,
+    budget: Option<u64>,
 ) -> Drained {
     let mut out = Drained {
         parent: None,
@@ -833,6 +888,7 @@ async fn drain(
         prose: String::new(),
         reasoning: String::new(),
         prompt_tokens: 0,
+        truncated: false,
     };
     let mut router = FragmentRouter::new();
     let mut fragments = Vec::new();
@@ -903,10 +959,45 @@ async fn drain(
                         return out;
                     }
                 }
+                // Past the budget the turn is already decided: keep draining so
+                // the cursor and account slot stay correct, but forward nothing.
+                if out.truncated {
+                    continue;
+                }
+                // Trim the fragment that crosses the budget instead of dropping
+                // it whole, so the client still receives what fits.
+                let fragment = match budget {
+                    Some(limit) => {
+                        let room = limit
+                            .saturating_sub(estimate_tokens(&out.prose))
+                            .saturating_sub(estimate_tokens(&out.reasoning));
+                        if room == 0 {
+                            out.truncated = true;
+                            continue;
+                        }
+                        let trimmed = trim_to_tokens(&fragment.text, room);
+                        if trimmed.len() < fragment.text.len() {
+                            out.truncated = true;
+                        }
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let mut fragment = fragment;
+                        fragment.text = trimmed;
+                        fragment
+                    }
+                    None => fragment,
+                };
                 let event = match fragment.channel {
                     Channel::Text => {
                         out.text.push_str(&fragment.text);
-                        let safe = out.filter.feed(&fragment.text);
+                        let mut safe = out.filter.feed(&fragment.text);
+                        // A truncated tail can end inside a tool block the filter
+                        // is holding back. Release it: the block cannot execute
+                        // anyway, and the prose around it is still useful.
+                        if safe.is_empty() && out.truncated {
+                            safe = out.filter.finish();
+                        }
                         if safe.is_empty() {
                             continue;
                         }
@@ -1052,6 +1143,7 @@ mod tests {
                 "tool_choice",
                 "reasoning",
                 "verbosity",
+                "max_output_tokens",
                 "stored_responses",
                 "previous_response",
             ]
@@ -1242,7 +1334,7 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(16);
         let mut announced = false;
-        let drained = drain(response(raw), &tx, &mut announced).await;
+        let drained = drain(response(raw), &tx, &mut announced, None).await;
         drop(tx);
         let mut seen = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -1271,7 +1363,7 @@ mod tests {
         let raw = "event: hint\ndata: {\"type\":\"error\",\"content\":\"rate limit exceeded\"}\n\n";
         let (tx, mut rx) = mpsc::channel(4);
         let mut announced = false;
-        let drained = drain(response(raw), &tx, &mut announced).await;
+        let drained = drain(response(raw), &tx, &mut announced, None).await;
         assert_eq!(drained.hint.as_deref(), Some("rate limit exceeded"));
         assert!(!announced && !drained.emitted && !drained.complete);
         assert!(rx.try_recv().is_err());
@@ -1285,6 +1377,7 @@ mod tests {
             response("{\"code\":26,\"biz_msg\":\"invalid message id\"}"),
             &tx,
             &mut announced,
+            None,
         )
         .await;
         assert_eq!(stale.hint.as_deref(), Some("invalid message id"));
@@ -1292,6 +1385,7 @@ mod tests {
             response("synthetic private model output"),
             &tx,
             &mut announced,
+            None,
         )
         .await;
         assert_eq!(private.hint.as_deref(), Some("non-SSE upstream response"));
@@ -1312,12 +1406,63 @@ mod tests {
         }
     }
 
+    /// Once the budget is reached, later text is not forwarded, but the stream
+    /// is still drained so the cursor and account slot stay correct.
+    #[tokio::test]
+    async fn drain_stops_forwarding_at_the_output_budget() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut announced = false;
+        let raw = concat!(
+            "data: {\"v\":\"alpha beta gamma delta epsilon zeta eta theta\"}\n\n",
+            "data: {\"v\":\" iota kappa lambda mu\"}\n\n",
+            "data: {\"response_message_id\":7}\n\n",
+            "data: {\"p\":\"response/status\",\"v\":\"FINISHED\"}\n\n"
+        );
+        let drained = drain(response(raw), &tx, &mut announced, Some(3)).await;
+        assert!(drained.truncated, "the budget must be reported");
+        assert!(drained.complete, "the upstream is still drained");
+        assert_eq!(drained.parent, Some(7), "the cursor survives truncation");
+        let mut forwarded = String::new();
+        while let Ok(TurnEvent::Text(text)) = rx.try_recv() {
+            forwarded.push_str(&text);
+        }
+        // The stream filter may hold a trailing partial tag back, so assert on
+        // the drain's decisions instead of on exact chunk boundaries.
+        assert!(
+            estimate_tokens(&forwarded) <= 3,
+            "forwarded text must stay within the budget: {forwarded:?}"
+        );
+        assert!(
+            !forwarded.contains("iota"),
+            "text past the budget must not reach the client: {forwarded:?}"
+        );
+    }
+
+    #[test]
+    fn budget_arithmetic_counts_reasoning_and_trims_by_tokens() {
+        assert!(over_budget("some words here", "", Some(1)));
+        assert!(over_budget("", "reasoning also counts", Some(1)));
+        assert!(!over_budget("short", "", Some(64)));
+        assert!(!over_budget("anything at all", "and more", None));
+        assert_eq!(trim_to_tokens("abcdef", 0), "");
+        assert_eq!(trim_to_tokens("short", 64), "short");
+        let trimmed = trim_to_tokens("alpha beta gamma delta", 2);
+        assert!(!trimmed.is_empty() && trimmed.len() < "alpha beta gamma delta".len());
+        assert!(estimate_tokens(&trimmed) <= 2);
+    }
+
     #[tokio::test]
     async fn drain_stops_when_the_consumer_is_gone() {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let mut announced = false;
-        let drained = drain(response("data: {\"v\":\"text\"}\n\n"), &tx, &mut announced).await;
+        let drained = drain(
+            response("data: {\"v\":\"text\"}\n\n"),
+            &tx,
+            &mut announced,
+            None,
+        )
+        .await;
         assert!(drained.cancelled);
     }
 

@@ -5,6 +5,7 @@
 //! config file invites silent divergence from the server.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// File-backed configuration. Every field is optional; unset means "use the
@@ -16,6 +17,20 @@ pub struct FileConfig {
     pub storage: StorageSection,
     pub deepseek: DeepseekSection,
     pub limits: LimitsSection,
+    /// Keyed by channel id, e.g. `[channels.deepseek_web]`.
+    pub channels: HashMap<String, ChannelSection>,
+}
+
+/// Per-channel tuning for the `/v1/responses` adapters.
+///
+/// `max_output_tokens` is the output budget the proxy itself enforces. An
+/// upstream that has no such parameter (the DeepSeek web API) cannot apply it,
+/// so the proxy truncates instead. A request above this value is rejected;
+/// a request within it is honoured by local truncation.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct ChannelSection {
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +161,9 @@ pub struct Config {
     pub request_timeout_secs: f64,
     pub heartbeat_interval_secs: f64,
     pub image_max_bytes: usize,
+    /// Output budget per channel id, resolved from `[channels.<id>]` and
+    /// `CHANNEL_MAX_OUTPUT_TOKENS`. A channel absent here has no limit.
+    pub channel_max_output_tokens: HashMap<String, u32>,
 }
 
 impl Config {
@@ -194,6 +212,10 @@ impl Config {
                 .unwrap_or(file.limits.heartbeat_interval_secs)
                 .max(1.0),
             image_max_bytes: env_num("IMAGE_MAX_BYTES").unwrap_or(file.limits.image_max_bytes),
+            channel_max_output_tokens: resolve_channel_limits(
+                &file.channels,
+                env_str("CHANNEL_MAX_OUTPUT_TOKENS").as_deref(),
+            ),
         })
     }
 
@@ -213,6 +235,45 @@ pub fn resolve_max_inflight_per_account(file_val: usize, env_val: Option<&str>) 
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(file_val)
         .max(1)
+}
+
+/// Resolve per-channel output budgets from the file section plus the optional
+/// `CHANNEL_MAX_OUTPUT_TOKENS` override (`deepseek_web=8192,other=4096`).
+///
+/// A limit below 1 is meaningless and dropped, so a typo cannot silently make
+/// every request fail. Channels with no configured limit stay absent, which
+/// keeps the fail-closed behaviour for `max_output_tokens`.
+pub fn resolve_channel_limits(
+    file: &HashMap<String, ChannelSection>,
+    env_val: Option<&str>,
+) -> HashMap<String, u32> {
+    let mut limits: HashMap<String, u32> = file
+        .iter()
+        .filter_map(|(id, section)| {
+            section
+                .max_output_tokens
+                .filter(|limit| *limit >= 1)
+                .map(|limit| (id.clone(), limit))
+        })
+        .collect();
+    for entry in env_val.unwrap_or_default().split(',') {
+        let Some((id, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let (id, value) = (id.trim(), value.trim());
+        if id.is_empty() {
+            continue;
+        }
+        match value.parse::<u32>() {
+            Ok(limit) if limit >= 1 => {
+                limits.insert(id.to_string(), limit);
+            }
+            _ => {
+                limits.remove(id);
+            }
+        }
+    }
+    limits
 }
 
 /// Resolve a relative path against the config file's directory, so a relative

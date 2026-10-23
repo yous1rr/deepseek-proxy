@@ -25,12 +25,23 @@ db_path = "deepseek-rs.db"
 model = "deepseek-chat"
 
 # Default thinking flag for requests that do not specify one.
-thinking = false
+thinking = true
 
 # Send the web-search flag. Leave this false unless you have a reason:
 # thinking+search is throttled hard by the backend, and a mid-stream limit
 # turns into a failed turn rather than a retry.
-search = false
+search = true
+
+[channels.deepseek_web]
+# Output budget for `/v1/responses`. DeepSeek's private API has no such
+# parameter, so the proxy enforces it locally: once this many tokens (reasoning
+# included) have been produced it stops forwarding and reports
+# `status=incomplete` with `incomplete_details.reason=max_output_tokens`.
+#
+# A request above this value is rejected with `max_output_tokens_exceeded`;
+# a request within it runs and may be truncated. Remove the key to keep
+# `max_output_tokens` unsupported (fail closed) for this channel.
+max_output_tokens = 384000
 
 [limits]
 # Seconds to wait after a request finishes before starting the next one on

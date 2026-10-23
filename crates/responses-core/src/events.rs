@@ -432,7 +432,28 @@ impl EventEncoder {
     /// returned.
     pub fn complete(&mut self) -> StreamEvent {
         let response = self.completed_response();
-        self.emit("response.completed", json!({"response": response}))
+        self.emit("response.completed", json!({ "response": response }))
+    }
+
+    /// The response object for a turn that stopped at the output budget.
+    ///
+    /// `status` is `incomplete` with `incomplete_details.reason` set, which is
+    /// how OpenAI reports a truncated answer and what clients check before
+    /// trusting an output limit.
+    pub fn incomplete_response(&mut self, reason: &str) -> Value {
+        let completed_at = *self.completed_at.get_or_insert_with(unix_seconds);
+        let mut object = self.snapshot_as("incomplete", Value::Null, Some(completed_at));
+        if let Value::Object(map) = &mut object {
+            map.insert("incomplete_details".into(), json!({ "reason": reason }));
+        }
+        object
+    }
+
+    /// `response.incomplete`, carrying exactly what
+    /// [`Self::incomplete_response`] returned.
+    pub fn incomplete(&mut self, reason: &str) -> StreamEvent {
+        let response = self.incomplete_response(reason);
+        self.emit("response.incomplete", json!({ "response": response }))
     }
 
     /// `response.failed`. `code` is a Responses error code such as

@@ -67,6 +67,8 @@ struct Settings {
     image_max_bytes: usize,
     /// SSE keep-alive interval in seconds (`HEARTBEAT_INTERVAL`).
     heartbeat_interval_secs: f64,
+    /// Output budget per Responses channel id (`[channels.<id>]`).
+    channel_max_output_tokens: std::collections::HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -2755,6 +2757,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_timeout_secs: cfg.request_timeout_secs,
         image_max_bytes: cfg.image_max_bytes,
         heartbeat_interval_secs: cfg.heartbeat_interval_secs,
+        channel_max_output_tokens: cfg.channel_max_output_tokens.clone(),
     };
     tracing::info!(
         db_path = %cfg.db_path,
@@ -3516,6 +3519,7 @@ mod tests {
                 request_timeout_secs: 2.0,
                 image_max_bytes: 1024,
                 heartbeat_interval_secs: 0.1,
+                channel_max_output_tokens: std::collections::HashMap::new(),
             },
             threads: Arc::new(Mutex::new(HashMap::new())),
             turns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

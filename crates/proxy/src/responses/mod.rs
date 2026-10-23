@@ -324,7 +324,55 @@ pub async fn create(State(state): State<AppState>, headers: HeaderMap, body: Byt
         }
     };
     let runtime = state.responses.clone();
-    if let Some(requirement) = plan.unmet(&runtime.capabilities) {
+    // `max_output_tokens` is enforced by the proxy, not the upstream, so the
+    // channel limit decides validity: within it the turn runs and is truncated
+    // locally, above it the request is rejected. A channel with no configured
+    // limit keeps the fail-closed behaviour and still needs the capability.
+    let channel_limit = state
+        .settings
+        .channel_max_output_tokens
+        .get(runtime.channel.id())
+        .copied();
+    if let Some(requested) = plan.echo.max_output_tokens {
+        match channel_limit {
+            Some(limit) if requested > i64::from(limit) => {
+                state.stats.errors.fetch_add(1, Ordering::Relaxed);
+                return ProxyError::new(
+                    format!(
+                        "max_output_tokens {requested} exceeds this channel's limit of {limit}"
+                    ),
+                    StatusCode::BAD_REQUEST,
+                    "max_output_tokens_exceeded",
+                )
+                .with_param("max_output_tokens")
+                .into_response();
+            }
+            // Within the channel limit the proxy truncates locally, so the
+            // capability gate must not reject the request.
+            Some(_) => {}
+            None => {
+                if !runtime.capabilities.enabled(Capability::MaxOutputTokens) {
+                    state.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    return ProxyError::new(
+                        format!(
+                            "'max_output_tokens' requires capability 'max_output_tokens', which channel '{}' does not support",
+                            runtime.channel.id()
+                        ),
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_parameter",
+                    )
+                    .with_param("max_output_tokens")
+                    .into_response();
+                }
+            }
+        }
+    }
+    // A channel limit already validated the field above; only gate on the
+    // capability when the proxy has no budget of its own to enforce.
+    let requirement = plan.unmet(&runtime.capabilities).filter(|requirement| {
+        !(requirement.capability == Capability::MaxOutputTokens && channel_limit.is_some())
+    });
+    if let Some(requirement) = requirement {
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
         return request_error(gate(&runtime.capabilities, requirement));
     }
@@ -661,7 +709,13 @@ async fn run(
     if !send_events(&out, job.stream, finish).await || out.is_closed() {
         return;
     }
-    let response = encoder.completed_response();
+    // A truncated turn is still persisted: the checkpoint keeps the remote
+    // session usable, so the next request continues instead of replaying.
+    let truncated = outcome.truncated.clone();
+    let response = match truncated.as_deref() {
+        Some(reason) => encoder.incomplete_response(reason),
+        None => encoder.completed_response(),
+    };
     if let Err(error) = commit(&state, &job, &response, &encoder, &outcome) {
         tracing::error!(thread = %job.thread_id, error = %error, "could not commit Responses state");
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -678,11 +732,21 @@ async fn run(
         .await;
         return;
     }
-    if job.stream {
-        let completed = encoder.complete();
-        let _ = out.send(Outbound::Event(completed)).await;
-    } else {
-        let _ = out.send(Outbound::Finished(Ok(response))).await;
+    match (truncated.as_deref(), job.stream) {
+        (Some(reason), true) => {
+            let incomplete = encoder.incomplete(reason);
+            let _ = out.send(Outbound::Event(incomplete)).await;
+        }
+        (Some(_), false) => {
+            let _ = out.send(Outbound::Finished(Ok(response))).await;
+        }
+        (None, true) => {
+            let completed = encoder.complete();
+            let _ = out.send(Outbound::Event(completed)).await;
+        }
+        (None, false) => {
+            let _ = out.send(Outbound::Finished(Ok(response))).await;
+        }
     }
     state.stats.ok.fetch_add(1, Ordering::Relaxed);
 }
@@ -705,7 +769,10 @@ fn commit(
             previous_response_id: job.previous_response_id.clone(),
             thread_id: job.thread_id.clone(),
             model: job.model.clone(),
-            status: "completed".into(),
+            status: match outcome.truncated {
+                Some(_) => "incomplete".into(),
+                None => "completed".into(),
+            },
             response_json: response.to_string(),
             transcript_json: serde_json::to_string(&transcript)
                 .map_err(|error| format!("encode transcript: {error}"))?,

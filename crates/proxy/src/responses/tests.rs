@@ -56,6 +56,7 @@ pub(super) async fn test_state(responses: Runtime) -> AppState {
             request_timeout_secs: 5.0,
             image_max_bytes: 1024,
             heartbeat_interval_secs: 30.0,
+            channel_max_output_tokens: HashMap::new(),
         },
         threads: Arc::new(Mutex::new(HashMap::new())),
         turns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -74,6 +75,8 @@ enum Ending {
     Complete {
         calls: Vec<(&'static str, &'static str)>,
         checkpoint: bool,
+        /// Reason reported when the channel stopped at its output budget.
+        truncated: Option<&'static str>,
     },
     Fail {
         status: StatusCode,
@@ -95,6 +98,7 @@ fn answer(text: &'static str) -> Script {
         ending: Ending::Complete {
             calls: Vec::new(),
             checkpoint: true,
+            truncated: None,
         },
     }
 }
@@ -177,7 +181,11 @@ impl ResponsesChannel for FakeChannel {
                 }
             }
             match script.ending {
-                Ending::Complete { calls, checkpoint } => Ok(TurnOutcome {
+                Ending::Complete {
+                    calls,
+                    checkpoint,
+                    truncated,
+                } => Ok(TurnOutcome {
                     calls: calls
                         .into_iter()
                         .map(|(name, arguments)| FunctionCall {
@@ -201,6 +209,7 @@ impl ResponsesChannel for FakeChannel {
                             message_count: 1,
                         },
                     }),
+                    truncated: truncated.map(str::to_string),
                 }),
                 Ending::Fail {
                     status,
@@ -331,6 +340,7 @@ async fn streaming_turn_emits_ordered_events_and_stores_the_completed_response()
             ending: Ending::Complete {
                 calls: Vec::new(),
                 checkpoint: true,
+                truncated: None,
             },
         }],
     )
@@ -449,6 +459,7 @@ async fn function_calls_round_trip_through_previous_response_id() {
                 ending: Ending::Complete {
                     calls: vec![("lookup", "{\"q\":1}")],
                     checkpoint: true,
+                    truncated: None,
                 },
             },
             answer("done"),
@@ -786,6 +797,7 @@ async fn multiple_calls_with_parallel_tool_calls_false_fail_the_turn() {
             ending: Ending::Complete {
                 calls: vec![("lookup", "{}"), ("lookup", "{}")],
                 checkpoint: true,
+                truncated: None,
             },
         }],
     )
@@ -870,6 +882,7 @@ async fn reasoning_is_neither_requested_nor_shown_without_the_capability() {
             ending: Ending::Complete {
                 calls: Vec::new(),
                 checkpoint: false,
+                truncated: None,
             },
         }],
     )
@@ -1020,4 +1033,116 @@ fn thread_ids_prefer_session_identity_and_stay_owner_scoped() {
         derive_thread_id(&HeaderMap::new(), "owner-a", &no_user),
         derive_thread_id(&HeaderMap::new(), "owner-a", &no_user)
     );
+}
+
+/// A channel budget makes `max_output_tokens` valid even when the channel does
+/// not declare the capability, because the proxy enforces it locally.
+#[tokio::test]
+async fn channel_budget_accepts_a_request_within_the_limit() {
+    let mut h = harness(&DEFAULTS, vec![answer("ok")]).await;
+    h.state
+        .settings
+        .channel_max_output_tokens
+        .insert("fake".into(), 8192);
+    let response = post(
+        &h.state,
+        bearer(""),
+        json!({"input": "hi", "stream": false, "max_output_tokens": 4096}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["status"], "completed");
+}
+
+/// Above the configured budget the request is rejected, naming the limit.
+#[tokio::test]
+async fn request_above_the_channel_budget_is_rejected() {
+    let mut h = harness(&DEFAULTS, vec![answer("unused")]).await;
+    h.state
+        .settings
+        .channel_max_output_tokens
+        .insert("fake".into(), 1024);
+    let response = post(
+        &h.state,
+        bearer(""),
+        json!({"input": "hi", "stream": false, "max_output_tokens": 2048}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["code"], "max_output_tokens_exceeded");
+    assert_eq!(body["error"]["param"], "max_output_tokens");
+    assert!(body["error"]["message"].as_str().unwrap().contains("1024"));
+}
+
+/// Without a channel budget the field stays fail-closed.
+#[tokio::test]
+async fn request_without_a_channel_budget_stays_fail_closed() {
+    let h = harness(&DEFAULTS, vec![answer("unused")]).await;
+    let response = post(
+        &h.state,
+        bearer(""),
+        json!({"input": "hi", "stream": false, "max_output_tokens": 4096}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+}
+
+/// A truncated turn ends as `incomplete` and still keeps its checkpoint, so
+/// the next request continues the remote session instead of replaying.
+#[tokio::test]
+async fn truncated_turn_reports_incomplete_and_keeps_the_checkpoint() {
+    let script = Script {
+        steps: vec![Step::Text("partial answer")],
+        ending: Ending::Complete {
+            calls: Vec::new(),
+            checkpoint: true,
+            truncated: Some("max_output_tokens"),
+        },
+    };
+    let mut h = harness(&DEFAULTS, vec![script]).await;
+    h.state
+        .settings
+        .channel_max_output_tokens
+        .insert("fake".into(), 8192);
+    let response = post(
+        &h.state,
+        bearer(""),
+        json!({"input": "hi", "stream": false, "max_output_tokens": 16}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["status"], "incomplete");
+    assert_eq!(body["incomplete_details"]["reason"], "max_output_tokens");
+    let stored = h.fake.seen.lock().unwrap()[0].max_output_tokens;
+    assert_eq!(stored, Some(16), "the budget reaches the channel");
+    assert!(
+        h.state
+            .store
+            .get_thread_history(&h.fake.seen.lock().unwrap()[0].thread_id)
+            .unwrap()
+            .is_some(),
+        "a truncated turn still checkpoints"
+    );
+}
+
+/// The budget is forwarded unchanged when the channel has no limit configured
+/// but the capability is enabled.
+#[tokio::test]
+async fn channel_receives_the_requested_budget() {
+    let mut enabled = DEFAULTS.to_vec();
+    enabled.push(Capability::MaxOutputTokens);
+    let h = harness(&enabled, vec![answer("ok")]).await;
+    let response = post(
+        &h.state,
+        bearer(""),
+        json!({"input": "hi", "stream": false, "max_output_tokens": 64}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(h.fake.seen.lock().unwrap()[0].max_output_tokens, Some(64));
 }

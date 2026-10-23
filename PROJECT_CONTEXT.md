@@ -270,3 +270,18 @@ cargo fmt --all -- --check
 回归测试：`tool_call_ids_stay_unique_across_turns`（两轮流式工具调用产生不同 ID，且下一轮请求能续接保存的历史；撤掉修复后该测试失败）和 `tool_call_ids_never_repeat`。
 
 已知残留：Pi 连接自定义端点时不支持会话中途的 system 消息，技能或工具状态变化会改写首条 system 消息，代理在这些节点仍会新建会话并完整回放。上下文不丢失，也不会循环。
+
+## v0.1.5：`max_output_tokens` 渠道上限与本地截断
+
+Pi Desktop 的 `openai-responses` 适配器默认 `supportsMaxOutputTokens = true`，只要模型配置了 maxTokens 就会发送 `max_output_tokens`。DeepSeek 私有接口没有这个参数，此前 `deepseek_web` 把它标为不支持，导致每个请求都返回 400 `unsupported_parameter`。
+
+现在改为由代理自己执行这个上限：
+
+- `config.toml` 的 `[channels.deepseek_web] max_output_tokens = 8192`（或用 `CHANNEL_MAX_OUTPUT_TOKENS=<channel>=<n>` 覆盖）。渠道不配置时保持 fail-closed。
+- 请求值超过渠道上限 → 400 `max_output_tokens_exceeded`，消息中给出渠道上限值。
+- 请求值在上限内 → 正常执行，`drain` 按 `cl100k_base` 累计 token（**推理计入**）裁剪并停止转发超出部分，回合以 `status=incomplete`、`incomplete_details.reason=max_output_tokens` 结束；流式发 `response.incomplete`。
+- 截断的回合仍写入 checkpoint，下一轮续接同一远程会话而不是重放；该回合不执行工具调用，因为参数可能被预算切断。
+
+局限：只能截断转发，不能阻止上游继续生成（费用照付）；token 估算与 DeepSeek 实际分词存在偏差；预算恰好落在 `<invoke>` 中间时该调用被丢弃。
+
+相关测试：`channel_budget_accepts_a_request_within_the_limit`、`request_above_the_channel_budget_is_rejected`、`request_without_a_channel_budget_stays_fail_closed`、`truncated_turn_reports_incomplete_and_keeps_the_checkpoint`、`channel_receives_the_requested_budget`、`drain_stops_forwarding_at_the_output_budget`、`budget_arithmetic_counts_reasoning_and_trims_by_tokens`。
