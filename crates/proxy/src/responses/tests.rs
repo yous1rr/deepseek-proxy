@@ -57,6 +57,7 @@ pub(super) async fn test_state(responses: Runtime) -> AppState {
             image_max_bytes: 1024,
             heartbeat_interval_secs: 30.0,
             channel_max_output_tokens: HashMap::new(),
+            fresh_session_per_request: false,
         },
         threads: Arc::new(Mutex::new(HashMap::new())),
         turns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

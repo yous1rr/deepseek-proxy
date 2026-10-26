@@ -73,6 +73,13 @@ pub struct DeepseekSection {
     /// Send the web-search flag. Off by default: thinking+search is throttled
     /// hard by the backend and turns transient limits into hard failures.
     pub search: bool,
+    /// Create a brand-new remote session for every request and send only that
+    /// request's own input, carrying no conversation history.
+    ///
+    /// Intended for stateless decision calls (e.g. a fast classifier) where a
+    /// contaminated context is worse than a cold start. Off by default; while
+    /// off, session reuse and persistence behave exactly as before.
+    pub fresh_session_per_request: bool,
 }
 
 impl Default for DeepseekSection {
@@ -81,6 +88,7 @@ impl Default for DeepseekSection {
             model: "deepseek-chat".into(),
             thinking: false,
             search: false,
+            fresh_session_per_request: false,
         }
     }
 }
@@ -164,6 +172,9 @@ pub struct Config {
     /// Output budget per channel id, resolved from `[channels.<id>]` and
     /// `CHANNEL_MAX_OUTPUT_TOKENS`. A channel absent here has no limit.
     pub channel_max_output_tokens: HashMap<String, u32>,
+    /// When true, every request gets a brand-new remote session and carries
+    /// only its own input. See `DeepseekSection::fresh_session_per_request`.
+    pub fresh_session_per_request: bool,
 }
 
 impl Config {
@@ -185,6 +196,10 @@ impl Config {
             model: env_str("MODEL_NAME").unwrap_or(file.deepseek.model),
             thinking: env_flag("THINKING_ENABLED", file.deepseek.thinking),
             search: env_flag("SEARCH_ENABLED", file.deepseek.search),
+            fresh_session_per_request: env_flag(
+                "FRESH_SESSION_PER_REQUEST",
+                file.deepseek.fresh_session_per_request,
+            ),
             max_inflight_per_account: resolve_max_inflight_per_account(
                 file.limits.max_inflight_per_account,
                 env_str("MAX_INFLIGHT_PER_ACCOUNT").as_deref(),
@@ -333,6 +348,15 @@ mod tests {
         assert_eq!(f.proxy.host, "0.0.0.0");
         assert_eq!(f.limits.request_delay_secs, 0.0);
         assert!(!f.deepseek.search);
+    }
+
+    #[test]
+    fn fresh_session_defaults_off_and_parses_from_toml() {
+        let default: FileConfig = toml::from_str("").unwrap();
+        assert!(!default.deepseek.fresh_session_per_request);
+        let on: FileConfig =
+            toml::from_str("[deepseek]\nfresh_session_per_request = true\n").unwrap();
+        assert!(on.deepseek.fresh_session_per_request);
     }
 
     #[test]

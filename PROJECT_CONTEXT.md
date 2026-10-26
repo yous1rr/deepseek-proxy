@@ -285,3 +285,20 @@ Pi Desktop 的 `openai-responses` 适配器默认 `supportsMaxOutputTokens = tru
 局限：只能截断转发，不能阻止上游继续生成（费用照付）；token 估算与 DeepSeek 实际分词存在偏差；预算恰好落在 `<invoke>` 中间时该调用被丢弃。
 
 相关测试：`channel_budget_accepts_a_request_within_the_limit`、`request_above_the_channel_budget_is_rejected`、`request_without_a_channel_budget_stays_fail_closed`、`truncated_turn_reports_incomplete_and_keeps_the_checkpoint`、`channel_receives_the_requested_budget`、`drain_stops_forwarding_at_the_output_budget`、`budget_arithmetic_counts_reasoning_and_trims_by_tokens`。
+
+## v0.1.6：`fresh_session_per_request` 无状态决策模式
+
+新增配置项 `[deepseek] fresh_session_per_request`（默认 `false`，环境变量 `FRESH_SESSION_PER_REQUEST` 可覆盖），用于模拟快速决策调用：每次请求都必须从干净上下文开始。
+
+开启后的行为（Chat Completions 与 Responses 两条路径一致）：
+
+- 每次请求都调用 `create_chat_session` 新建远程会话，不复用也不读取已存会话。
+- 提示词只包含本轮输入（最后一条 assistant 消息之后的部分），不回放任何历史。
+- 完全不读写 `threads` / `thread_history`，也不写 checkpoint（`rebuild_session(..., persist=false)`）。
+- `can_recover` 恒为 false：没有可重放的上下文，也就没有会话重建恢复。
+
+关闭时上述判断全部短路，读取、续接、失效、checkpoint 提交与 `rebuild_session(persist=true)` 走原有路径，行为与 v0.1.5 完全一致。
+
+注意：开启后模型看不到本轮之前的任何内容，包括此前的工具调用结果，因此只适合单轮分类/决策，不适合多轮工具任务。
+
+相关测试：`fresh_session_defaults_off_and_parses_from_toml`、`fresh_request_carries_only_the_current_turn`；另用隔离端口和数据库副本做过端到端验证（两次请求均 200，`threads`/`thread_history` 行数与复制前一致，未新增记录）。

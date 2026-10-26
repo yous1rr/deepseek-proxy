@@ -32,6 +32,15 @@ thinking = true
 # turns into a failed turn rather than a retry.
 search = true
 
+# Stateless decision mode. When true, EVERY request gets a brand-new DeepSeek
+# session and carries only that request's own trailing input: no earlier turn is
+# replayed and no thread/cursor state is written, so nothing a previous request
+# said can leak into this one. Intended for fast classification/decision calls.
+#
+# Off by default. While false, session reuse, history replay and persistence
+# behave exactly as before.
+fresh_session_per_request = false
+
 [channels.deepseek_web]
 # Output budget for `/v1/responses`. DeepSeek's private API has no such
 # parameter, so the proxy enforces it locally: once this many tokens (reasoning

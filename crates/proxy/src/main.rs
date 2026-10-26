@@ -69,6 +69,9 @@ struct Settings {
     heartbeat_interval_secs: f64,
     /// Output budget per Responses channel id (`[channels.<id>]`).
     channel_max_output_tokens: std::collections::HashMap<String, u32>,
+    /// Every request gets a brand-new remote session carrying only its own
+    /// input. Off by default; when off nothing in this file changes behaviour.
+    fresh_session_per_request: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -181,14 +184,13 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Msg {
     role: String,
     #[serde(default)]
     content: Option<Value>,
     // Deserialized for completeness; the prompt builders only need role/content.
     #[serde(default)]
-    #[allow(dead_code)]
     tool_calls: Vec<Value>,
     /// Tool-call id this result answers, rendered as `Tool result (id=...)`.
     #[serde(default)]
@@ -288,6 +290,28 @@ fn tool_choice_directive(req: &ChatRequest) -> Option<String> {
     }
 }
 
+/// A request narrowed to its own trailing input.
+///
+/// Fresh-session mode sends exactly one turn, so the messages it may replay are
+/// the ones after the last assistant reply. Everything earlier belongs to other
+/// requests and must not leak into a decision call.
+fn fresh_request(req: &ChatRequest) -> ChatRequest {
+    ChatRequest {
+        model: req.model.clone(),
+        thread_id: req.thread_id.clone(),
+        prompt_cache_key: req.prompt_cache_key.clone(),
+        messages: delta_messages(&req.messages).to_vec(),
+        stream: req.stream,
+        reasoning_effort: req.reasoning_effort.clone(),
+        thinking: req.thinking.clone(),
+        reasoning: req.reasoning.clone(),
+        tools: req.tools.clone(),
+        tool_choice: req.tool_choice.clone(),
+        parallel_tool_calls: req.parallel_tool_calls,
+        stream_options: req.stream_options.clone(),
+    }
+}
+
 fn completion_body(
     thread: &ThreadState,
     prompt: &str,
@@ -346,6 +370,7 @@ async fn rebuild_session(
     conn: &Arc<pool::Connection>,
     key: &str,
     reason: &str,
+    persist: bool,
 ) -> Result<ThreadState, Response> {
     let session_id = {
         let _slot = conn.acquire().await.map_err(|e| queue_error(&e))?;
@@ -361,16 +386,20 @@ async fn rebuild_session(
         parent_message_id: None,
         exchanges: 0,
     };
-    state
-        .store
-        .save_thread(
-            key,
-            &store::ThreadResume {
-                session_id: fresh.session_id.clone(),
-                parent_message_id: None,
-            },
-        )
-        .map_err(|e| backend_error(&format!("save new thread: {e}")))?;
+    // Fresh-session mode keeps no resume state, so a later restart cannot make
+    // a decision call inherit an earlier session.
+    if persist {
+        state
+            .store
+            .save_thread(
+                key,
+                &store::ThreadResume {
+                    session_id: fresh.session_id.clone(),
+                    parent_message_id: None,
+                },
+            )
+            .map_err(|e| backend_error(&format!("save new thread: {e}")))?;
+    }
     state
         .threads
         .lock()
@@ -1320,21 +1349,34 @@ async fn chat_completions(
         Ok(conn) => conn,
         Err(e) => return route_unavailable(e).into_response(),
     };
-    let previous = match state.store.get_thread(&key) {
-        Ok(value) => value.map(|r| ThreadState {
-            session_id: r.session_id,
-            parent_message_id: r.parent_message_id.and_then(|p| p.parse().ok()),
-            exchanges: 0,
-        }),
-        Err(e) => return backend_error(&format!("read thread: {e}")),
+    // Fresh-session mode: a decision call must never see another request's
+    // context. Read no stored thread and reuse no history, so every request
+    // starts from an empty remote session. When the switch is off this block
+    // is skipped and the previous behaviour is unchanged.
+    let fresh = state.settings.fresh_session_per_request;
+    let previous = if fresh {
+        None
+    } else {
+        match state.store.get_thread(&key) {
+            Ok(value) => value.map(|r| ThreadState {
+                session_id: r.session_id,
+                parent_message_id: r.parent_message_id.and_then(|p| p.parse().ok()),
+                exchanges: 0,
+            }),
+            Err(e) => return backend_error(&format!("read thread: {e}")),
+        }
     };
-    let saved_history = match state.store.get_thread_history(&key) {
-        Ok(saved) => saved,
-        Err(e) => return backend_error(&format!("read thread history: {e}")),
+    let saved_history = if fresh {
+        None
+    } else {
+        match state.store.get_thread_history(&key) {
+            Ok(saved) => saved,
+            Err(e) => return backend_error(&format!("read thread history: {e}")),
+        }
     };
     let turn_history = TurnHistory::new(&req, &model);
     let continuation =
-        turn_history.can_continue(previous.as_ref(), saved_history.as_ref(), &conn.email);
+        !fresh && turn_history.can_continue(previous.as_ref(), saved_history.as_ref(), &conn.email);
     let existing = if continuation { previous } else { None };
     tracing::info!(
         thread = %key,
@@ -1348,9 +1390,11 @@ async fn chat_completions(
 
     let system_extra = dialect::inject_tool_descriptions("", &req.tools);
     let (specs, required) = resolve_tools(&req);
-    // Rebuilding a branch replays all of its inputs. Reload its attachment
-    // evidence too, within the existing one-image-per-prompt contract.
-    let inputs = if continuation {
+    // Fresh-session mode sends only this request's own input: the remote
+    // session is new, so replaying earlier turns would reintroduce exactly the
+    // history this mode exists to exclude. Attachments are loaded from the same
+    // slice so image evidence and text still describe one turn.
+    let inputs: &[Msg] = if fresh || continuation {
         delta_messages(&req.messages)
     } else {
         &req.messages
@@ -1369,25 +1413,41 @@ async fn chat_completions(
         .stats
         .images_dropped
         .fetch_add(loaded.dropped as u64, Ordering::Relaxed);
-    let (prompt, replay) = build_prompts(
-        &req,
-        existing.as_ref(),
-        &system_extra,
-        image_note.as_deref(),
-    );
+    let (prompt, replay) = if fresh {
+        // A fresh session has no delta to continue: the first (and only) prompt
+        // is built from this request's own input.
+        let fresh_req = fresh_request(&req);
+        build_prompts(&fresh_req, None, &system_extra, image_note.as_deref())
+    } else {
+        build_prompts(
+            &req,
+            existing.as_ref(),
+            &system_extra,
+            image_note.as_deref(),
+        )
+    };
     if prompt.is_empty() {
         return bad_request("no user message or tool result in continuation turn");
     }
     // Invalidate BEFORE upstream work. An interrupted, failed or unseen answer
     // must not later be mistaken for a fully acknowledged successful head.
-    if let Err(e) = state.store.clear_thread_history(&key) {
-        return backend_error(&format!("invalidate thread history: {e}"));
+    // Fresh-session mode writes no thread state at all, so there is nothing to
+    // invalidate and the remote session is created unconditionally below.
+    if !fresh {
+        if let Err(e) = state.store.clear_thread_history(&key) {
+            return backend_error(&format!("invalidate thread history: {e}"));
+        }
     }
-    let can_recover = continuation && !replay.is_empty();
+    let can_recover = !fresh && continuation && !replay.is_empty();
     let thread = match existing {
         Some(thread) => thread,
         None => {
-            match rebuild_session(&state, &conn, &key, "new or divergent request history").await {
+            let reason = if fresh {
+                "fresh session per request"
+            } else {
+                "new or divergent request history"
+            };
+            match rebuild_session(&state, &conn, &key, reason, !fresh).await {
                 Ok(thread) => thread,
                 Err(response) => return response,
             }
@@ -1454,6 +1514,7 @@ async fn chat_completions(
         specs,
         required,
         req.parallel_tool_calls,
+        fresh,
     )
     .await
 }
@@ -1786,6 +1847,8 @@ async fn stream_response(
     specs: Vec<dialect::ToolSpec>,
     required: bool,
     parallel: bool,
+    // Fresh-session mode: write no resume state for this turn.
+    fresh: bool,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
 
@@ -1933,7 +1996,7 @@ async fn stream_response(
                         hint = %hint,
                         "stale parent message id; rebuilding the session and replaying the transcript"
                     );
-                    match rebuild_session(&state, &conn, &key, &hint).await {
+                    match rebuild_session(&state, &conn, &key, &hint, true).await {
                         Ok(fresh) => {
                             let thinking = body.thinking_enabled;
                             let search = body.search_enabled;
@@ -1999,7 +2062,7 @@ async fn stream_response(
                     return;
                 }
                 context_recovered = true;
-                match rebuild_session(&state, &conn, &key, &hint).await {
+                match rebuild_session(&state, &conn, &key, &hint, true).await {
                     Ok(fresh) => {
                         let thinking = body.thinking_enabled;
                         let search = body.search_enabled;
@@ -2393,23 +2456,28 @@ async fn stream_response(
             return;
         }
         if let Some(mid) = cursor {
-            let history = turn_history.completed(&prose, &filter.calls, &conn.email);
-            let resume = store::ThreadResume {
-                session_id: session_id.clone(),
-                parent_message_id: Some(mid.to_string()),
-            };
-            if let Err(e) = state.store.save_thread_checkpoint(&key, &resume, &history) {
-                tracing::error!(thread = %key, error = %e, "could not commit successful history checkpoint");
-                send_stream_error(
-                    &tx,
-                    ProxyError::new(
-                        "Could not save conversation state",
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "state_commit_failed",
-                    ),
-                )
-                .await;
-                return;
+            // Fresh-session mode keeps no resume state: persisting it would let
+            // a later request inherit this one's context, which is exactly what
+            // the mode forbids.
+            if !fresh {
+                let history = turn_history.completed(&prose, &filter.calls, &conn.email);
+                let resume = store::ThreadResume {
+                    session_id: session_id.clone(),
+                    parent_message_id: Some(mid.to_string()),
+                };
+                if let Err(e) = state.store.save_thread_checkpoint(&key, &resume, &history) {
+                    tracing::error!(thread = %key, error = %e, "could not commit successful history checkpoint");
+                    send_stream_error(
+                        &tx,
+                        ProxyError::new(
+                            "Could not save conversation state",
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "state_commit_failed",
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
             state.threads.lock().unwrap().insert(
                 key.clone(),
@@ -2758,6 +2826,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         image_max_bytes: cfg.image_max_bytes,
         heartbeat_interval_secs: cfg.heartbeat_interval_secs,
         channel_max_output_tokens: cfg.channel_max_output_tokens.clone(),
+        fresh_session_per_request: cfg.fresh_session_per_request,
     };
     tracing::info!(
         db_path = %cfg.db_path,
@@ -2945,6 +3014,25 @@ mod tests {
 
         let (prompt, _) = build_prompts(&request(messages, vec![]), Some(&thread(1)), "", None);
         assert_eq!(prompt, "User: new");
+    }
+
+    /// Fresh-session mode narrows a request to its own trailing input, so a
+    /// decision call cannot see any earlier turn.
+    #[test]
+    fn fresh_request_carries_only_the_current_turn() {
+        let messages = vec![
+            msg_with("user", "old question"),
+            msg_with("assistant", "old answer"),
+            msg_with("user", "decide now"),
+        ];
+        let narrowed = fresh_request(&request(messages.clone(), vec![]));
+        assert_eq!(narrowed.messages.len(), 1);
+        assert_eq!(content_text(&narrowed.messages[0].content), "decide now");
+        // The prompt for a fresh session is built from that single turn only.
+        let (prompt, replay) = build_prompts(&narrowed, None, "", None);
+        assert_eq!(prompt, "User: decide now");
+        assert!(!prompt.contains("old question"));
+        assert!(!replay.contains("old answer"));
     }
 
     /// Tool round trip: the delta carries the assistant's call and the tool
@@ -3520,6 +3608,7 @@ mod tests {
                 image_max_bytes: 1024,
                 heartbeat_interval_secs: 0.1,
                 channel_max_output_tokens: std::collections::HashMap::new(),
+                fresh_session_per_request: false,
             },
             threads: Arc::new(Mutex::new(HashMap::new())),
             turns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3590,6 +3679,7 @@ mod tests {
             specs,
             required,
             true,
+            false,
         )
         .await;
         (state, response)

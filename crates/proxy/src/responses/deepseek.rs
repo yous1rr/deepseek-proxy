@@ -314,21 +314,33 @@ async fn run(
         .route_checked(&key)
         .await
         .map_err(route_unavailable)?;
-    let previous = state
-        .store
-        .get_thread(&key)
-        .map_err(|error| store_failure("read thread", error))?
-        .map(|resume| ThreadState {
-            session_id: resume.session_id,
-            parent_message_id: resume.parent_message_id.and_then(|p| p.parse().ok()),
-            exchanges: 0,
-        });
-    let saved_history = state
-        .store
-        .get_thread_history(&key)
-        .map_err(|error| store_failure("read thread history", error))?;
+    // Fresh-session mode: this decision turn must not inherit any stored
+    // context, so nothing is read back and the session below is always new.
+    let fresh = state.settings.fresh_session_per_request;
+    let previous = if fresh {
+        None
+    } else {
+        state
+            .store
+            .get_thread(&key)
+            .map_err(|error| store_failure("read thread", error))?
+            .map(|resume| ThreadState {
+                session_id: resume.session_id,
+                parent_message_id: resume.parent_message_id.and_then(|p| p.parse().ok()),
+                exchanges: 0,
+            })
+    };
+    let saved_history = if fresh {
+        None
+    } else {
+        state
+            .store
+            .get_thread_history(&key)
+            .map_err(|error| store_failure("read thread history", error))?
+    };
     let mut history = TurnHistory::new(&req, &turn.model);
-    let continuation = history.can_continue(previous.as_ref(), saved_history.as_ref(), &conn.email);
+    let continuation =
+        !fresh && history.can_continue(previous.as_ref(), saved_history.as_ref(), &conn.email);
     let existing = if continuation { previous } else { None };
     tracing::info!(
         thread = %key,
@@ -340,8 +352,9 @@ async fn run(
 
     let system_extra = dialect::inject_tool_descriptions("", &req.tools);
     let (specs, required) = resolve_tools(&req);
-    // A rebuilt branch replays all of its inputs, so it reloads their image.
-    let inputs: &[Msg] = if continuation {
+    // Only this request's own input reaches a fresh session; replaying earlier
+    // turns would reintroduce the history this mode exists to exclude.
+    let inputs: &[Msg] = if fresh || continuation {
         delta_messages(&req.messages)
     } else {
         &req.messages
@@ -369,23 +382,33 @@ async fn run(
         )
         .into());
     }
-    let can_recover = continuation && !replay.is_empty();
+    let can_recover = !fresh && continuation && !replay.is_empty();
     if let Some(directive) = turn.verbosity.and_then(verbosity_directive) {
         prompt.push_str(directive);
         replay.push_str(directive);
     }
 
     // Invalidate BEFORE upstream work: an interrupted or failed answer must
-    // never be mistaken later for a trusted head.
-    state
-        .store
-        .clear_thread_history(&key)
-        .map_err(|error| store_failure("invalidate thread history", error))?;
+    // never be mistaken later for a trusted head. Fresh-session mode writes no
+    // thread state, so there is nothing to invalidate.
+    if !fresh {
+        state
+            .store
+            .clear_thread_history(&key)
+            .map_err(|error| store_failure("invalidate thread history", error))?;
+    }
     let thread = match existing {
         Some(thread) => thread,
-        None => rebuild_session(&state, &conn, &key, "new or divergent request history")
-            .await
-            .map_err(TurnError::Http)?,
+        None => {
+            let reason = if fresh {
+                "fresh session per request"
+            } else {
+                "new or divergent request history"
+            };
+            rebuild_session(&state, &conn, &key, reason, !fresh)
+                .await
+                .map_err(TurnError::Http)?
+        }
     };
     state
         .threads
@@ -510,7 +533,7 @@ async fn run(
                     hint = %hint,
                     "stale parent message id; rebuilding the session and replaying the transcript"
                 );
-                let fresh = match rebuild_session(&state, &conn, &key, &hint).await {
+                let fresh = match rebuild_session(&state, &conn, &key, &hint, true).await {
                     Ok(fresh) => fresh,
                     Err(response) => {
                         return Err(fail_with_cursor(
@@ -558,7 +581,7 @@ async fn run(
                 ));
             }
             context_recovered = true;
-            let fresh = match rebuild_session(&state, &conn, &key, &hint).await {
+            let fresh = match rebuild_session(&state, &conn, &key, &hint, true).await {
                 Ok(fresh) => fresh,
                 Err(response) => {
                     return Err(fail_with_cursor(
@@ -754,13 +777,19 @@ async fn run(
         .fetch_add(accepted.len() as u64, Ordering::Relaxed);
     // `prose` is exactly the answer text the client received, so the stored
     // transcript replays into this fingerprint.
-    let checkpoint = cursor.map(|mid| Checkpoint {
-        resume: store::ThreadResume {
-            session_id: session_id.clone(),
-            parent_message_id: Some(mid.to_string()),
-        },
-        history: history.completed(&prose, &accepted, &conn.email),
-    });
+    // Fresh-session mode keeps no resume state: persisting it would let a later
+    // decision call inherit this one's context.
+    let checkpoint = if fresh {
+        None
+    } else {
+        cursor.map(|mid| Checkpoint {
+            resume: store::ThreadResume {
+                session_id: session_id.clone(),
+                parent_message_id: Some(mid.to_string()),
+            },
+            history: history.completed(&prose, &accepted, &conn.email),
+        })
+    };
     let reasoning_tokens = estimate_tokens(&reasoning);
     let mut output_tokens = estimate_tokens(&prose) + reasoning_tokens;
     for call in &accepted {
