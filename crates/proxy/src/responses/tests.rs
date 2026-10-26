@@ -1147,3 +1147,34 @@ async fn channel_receives_the_requested_budget() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(h.fake.seen.lock().unwrap()[0].max_output_tokens, Some(64));
 }
+
+/// Magpie's classifier asks at temperature 0. In fresh-session decision mode
+/// that is accepted and dropped; the channel still declares no sampling
+/// support, so every other mode keeps failing closed.
+#[tokio::test]
+async fn fresh_session_mode_accepts_sampling_it_cannot_forward() {
+    let mut h = harness(&DEFAULTS, vec![answer("ok")]).await;
+    h.state.settings.fresh_session_per_request = true;
+    let accepted = post(
+        &h.state,
+        bearer(""),
+        json!({"input": "decide", "stream": false, "temperature": 0}),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let body = body_json(accepted).await;
+    assert_eq!(body["status"], "completed");
+
+    let mut h = harness(&DEFAULTS, vec![answer("ok")]).await;
+    h.state.settings.fresh_session_per_request = false;
+    let refused = post(
+        &h.state,
+        bearer(""),
+        json!({"input": "decide", "stream": false, "temperature": 0}),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(refused).await;
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "temperature");
+}

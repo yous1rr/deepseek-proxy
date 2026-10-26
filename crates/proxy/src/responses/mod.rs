@@ -369,8 +369,18 @@ pub async fn create(State(state): State<AppState>, headers: HeaderMap, body: Byt
     }
     // A channel limit already validated the field above; only gate on the
     // capability when the proxy has no budget of its own to enforce.
+    //
+    // Sampling parameters are accepted in fresh-session decision mode: those
+    // callers (magpie's classifier asks at temperature 0) send a fixed value
+    // that this channel has no way to honour, and refusing it turns every
+    // decision call into a 400. The values are dropped, not forwarded, so the
+    // capability stays honest for every other mode.
+    let ignored_sampling = state.settings.fresh_session_per_request;
     let requirement = plan.unmet(&runtime.capabilities).filter(|requirement| {
-        !(requirement.capability == Capability::MaxOutputTokens && channel_limit.is_some())
+        if requirement.capability == Capability::MaxOutputTokens && channel_limit.is_some() {
+            return false;
+        }
+        !(ignored_sampling && requirement.capability == Capability::SamplingControls)
     });
     if let Some(requirement) = requirement {
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
