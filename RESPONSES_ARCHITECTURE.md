@@ -99,7 +99,9 @@ ChatGPT Web 通过 `ResponsesChannel` 接入，并按模型与 DeepSeek 渠道�
 
 两者共用的是 `crates/tool-engine`：`dialect` 负责教学文本、提取、schema 校验和流式过滤，`recovery` 负责 accept/repair 状态机与 `ToolPolicy`。该 crate 不做 IO、不持有会话，所以「纠正回合怎么送达」仍由各渠道自己决定。
 
-账号两条来源：`CHATGPT_TOKEN_<n>`/`CHATGPT_ACCESS_TOKEN_<n>` 环境变量，以及 `deepseek-rs chatgpt add` 写入的 `chatgpt_accounts` 表。同一身份以数据库行为准（它带 `expires_at`）。这两个来源都不会自动续期：网页会话只签发 access token，没有 refresh token。代理按 JWT 的 `exp`（不验签）在 72h/24h/2h 三档告警，通过 Bark（`BARK_URL`/`BARK_KEY`）推送或落日志；每档每个账号只发一次。配置了上述任一来源后，`GET /v1/models` 才广告 `auto`、`gpt-5*`、`gpt-image-2` 和 `codex-gpt-image-2`。`code_interpreter` 仍由能力门控拒绝，直到有可靠的沙箱事件映射。
+账号两条来源：`CHATGPT_TOKEN_<n>`/`CHATGPT_ACCESS_TOKEN_<n>` 环境变量，以及 `deepseek-rs chatgpt add` 写入的 `chatgpt_accounts` 表。同一身份以数据库行为准（它带 `expires_at`）。这两个来源都不会自动续期：网页会话只签发 access token，没有 refresh token。代理按 JWT 的 `exp`（不验签）在 72h/24h/2h 三档告警，通过 Bark（`BARK_URL`/`BARK_KEY`）推送或落日志；每档每个账号只发一次。配置了上述任一来源后，`GET /v1/models` 才广告 ChatGPT 型号。`code_interpreter` 仍由能力门控拒绝，直到有可靠的沙箱事件映射。
+
+模型清单以账号真实的 `GET /backend-api/models` 为准（实测 `model_picker_version` 2）：`gpt-6`、`gpt-6-mini`、`gpt-6-t-mini`、`gpt-6-t-mini-mini`、`gpt-5-6`、`gpt-5-6-mini`、`gpt-5-6-t-mini`、`gpt-5-6-t-mini-mini`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-2`、`gpt-5-1`、`gpt-5`、`gpt-5-mini`、`auto`，外加上游该端点未列出但图像流程需要的 `gpt-image-2` 与 `codex-gpt-image-2`。"Luna" 是 `gpt-5-6` 系列的显示标题，不是 slug，因此不存在 `gpt-6-luna`。目录会随账号变化，直接以 `deepseek-rs chatgpt check` 和上游 `/backend-api/models` 为准，不要在本地清单里猜型号。
 
 Rust 客户端使用 `reqwest`/rustls，并明确不声称复现 `curl_cffi` 的 Chrome TLS ClientHello 指纹；若上游要求浏览器指纹，需单独替换传输层。PoW 使用 SHA3-512 原生实现，Turnstile 只执行固定的 allowlisted bytecode 子集，不执行任意 JavaScript。
 

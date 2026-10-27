@@ -157,19 +157,11 @@ pub fn ceiling() -> CapabilitySet {
     }
     set
 }
-fn supports_model(model: &str) -> bool {
-    matches!(
-        model.trim().to_ascii_lowercase().as_str(),
-        "auto"
-            | "gpt-5"
-            | "gpt-5-1"
-            | "gpt-5-2"
-            | "gpt-5-3"
-            | "gpt-5-3-mini"
-            | "gpt-5-mini"
-            | "gpt-image-2"
-            | "codex-gpt-image-2"
-    )
+/// Slugs this channel routes. Kept in step with [`crate::config::CHATGPT_MODELS`]
+/// by a test below, so the advertised catalogue and the router cannot drift.
+pub(crate) fn supports_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    crate::config::CHATGPT_MODELS.contains(&model.as_str())
 }
 
 impl ResponsesChannel for ChatGptWeb {
@@ -907,22 +899,20 @@ mod tests {
 
     #[test]
     fn model_allowlist_is_case_insensitive_and_excludes_deepseek() {
-        for model in [
-            "auto",
-            "gpt-5",
-            "gpt-5-1",
-            "gpt-5-2",
-            "gpt-5-3",
-            "gpt-5-3-mini",
-            "gpt-5-mini",
-            "gpt-image-2",
-            "codex-gpt-image-2",
-        ] {
-            assert!(supports_model(model));
-            assert!(supports_model(&model.to_ascii_uppercase()));
+        for model in crate::config::CHATGPT_MODELS {
+            assert!(supports_model(model), "{model}");
+            assert!(supports_model(&model.to_ascii_uppercase()), "{model}");
+            assert!(supports_model(&format!("  {model}  ")), "{model}");
         }
-        for model in ["deepseek-chat", "deepseek-v3", "gpt-4o"] {
-            assert!(!supports_model(model));
+        for model in [
+            "deepseek-chat",
+            "deepseek-v3",
+            "gpt-4o",
+            // "Luna" is the display title of the gpt-5-6 family, not a slug.
+            "gpt-6-luna",
+            "gpt-5-6-luna",
+        ] {
+            assert!(!supports_model(model), "{model}");
         }
     }
 

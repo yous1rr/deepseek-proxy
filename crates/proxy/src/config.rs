@@ -75,14 +75,33 @@ pub type ChatgptConfig = ChatGptConfig;
 pub const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com";
 pub const DEFAULT_CHATGPT_TIMEOUT_SECS: f64 = 60.0;
 
-/// All ChatGPT Web model IDs known to the proxy from chatgpt2api.
+/// ChatGPT Web model slugs this proxy can route.
+///
+/// Verified against `GET /backend-api/models` on a live account
+/// (`model_picker_version` 2): the account offered `gpt-5-6`, `gpt-5-6-mini`,
+/// `gpt-5-6-t-mini`, `gpt-5-6-t-mini-mini`, `gpt-5-3-mini`, `research`,
+/// `gpt-6`, `gpt-6-mini`, `gpt-6-t-mini`, `gpt-6-t-mini-mini` and `auto`.
+/// "Luna" is the *display title* of the `gpt-5-6` family, not a slug of its
+/// own, so there is no `gpt-6-luna` upstream.
+///
+/// `gpt-image-2` and `codex-gpt-image-2` are image models that this endpoint
+/// did not list for this account; they stay because the image workflow needs
+/// them and the older catalogue exposed them.
 pub const CHATGPT_MODELS: &[&str] = &[
     "auto",
-    "gpt-5",
-    "gpt-5-1",
-    "gpt-5-2",
+    "gpt-6",
+    "gpt-6-mini",
+    "gpt-6-t-mini",
+    "gpt-6-t-mini-mini",
+    "gpt-5-6",
+    "gpt-5-6-mini",
+    "gpt-5-6-t-mini",
+    "gpt-5-6-t-mini-mini",
     "gpt-5-3",
     "gpt-5-3-mini",
+    "gpt-5-2",
+    "gpt-5-1",
+    "gpt-5",
     "gpt-5-mini",
     "gpt-image-2",
     "codex-gpt-image-2",
@@ -873,19 +892,41 @@ tokens = ["secret1", "secret2"]
 
     #[test]
     fn chatgpt_models_constant_and_function() {
-        let expected = [
+        assert_eq!(chatgpt_models(), CHATGPT_MODELS);
+        // Every slug must look like a slug; a display title must never leak in.
+        for model in CHATGPT_MODELS {
+            assert!(
+                model.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'-'
+                    || b == b'_'),
+                "{model}"
+            );
+        }
+        // No duplicates: /v1/models dedupes, so a repeat here would hide a typo.
+        for (index, model) in CHATGPT_MODELS.iter().enumerate() {
+            assert!(
+                !CHATGPT_MODELS[index + 1..].contains(model),
+                "duplicate {model}"
+            );
+        }
+        // The verified live slugs must all route.
+        for model in [
             "auto",
-            "gpt-5",
-            "gpt-5-1",
-            "gpt-5-2",
-            "gpt-5-3",
+            "gpt-6",
+            "gpt-6-mini",
+            "gpt-6-t-mini",
+            "gpt-6-t-mini-mini",
+            "gpt-5-6",
+            "gpt-5-6-mini",
+            "gpt-5-6-t-mini",
+            "gpt-5-6-t-mini-mini",
             "gpt-5-3-mini",
-            "gpt-5-mini",
-            "gpt-image-2",
-            "codex-gpt-image-2",
-        ];
-        assert_eq!(CHATGPT_MODELS, expected);
-        assert_eq!(chatgpt_models(), expected);
+        ] {
+            assert!(CHATGPT_MODELS.contains(&model), "missing {model}");
+        }
+        // "Luna" is a title, not a slug.
+        assert!(!CHATGPT_MODELS.contains(&"gpt-6-luna"));
     }
 
     #[test]

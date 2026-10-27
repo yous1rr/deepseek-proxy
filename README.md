@@ -28,9 +28,11 @@ curl http://127.0.0.1:9174/v1/chat/completions \
   prompting, validation and repair policy lives in a channel-neutral crate
   ([`crates/tool-engine`](crates/tool-engine)), so every prompted-tool upstream
   shares it.
-- **ChatGPT Web channel** — `gpt-5*` and the image models served through the
-  same `/v1/responses` surface, with web search and image generation as hosted
-  tools. Tools are prompted there too, so a ChatGPT model can drive an agent.
+- **ChatGPT Web channel** — the real slugs from the account's own
+  `/backend-api/models` (`gpt-6`, `gpt-6-mini`, `gpt-5-6`, …) plus the image
+  models, served through the same `/v1/responses` surface, with web search and
+  image generation as hosted tools. Tools are prompted there too, so a ChatGPT
+  model can drive an agent.
 - **Branch-aware sessions** — resume matching histories with a delta; replay the
   selected history after edits, regeneration, or revision changes without client changes.
 - **Multiple accounts** — several DeepSeek accounts behind one endpoint, with

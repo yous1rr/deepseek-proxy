@@ -4008,21 +4008,9 @@ mod tests {
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
 
-        // 3 base models + 9 ChatGPT models in stable order
-        let expected_ids = vec![
-            "DEFAULT",
-            "EXPERT",
-            "VISION",
-            "auto",
-            "gpt-5",
-            "gpt-5-1",
-            "gpt-5-2",
-            "gpt-5-3",
-            "gpt-5-3-mini",
-            "gpt-5-mini",
-            "gpt-image-2",
-            "codex-gpt-image-2",
-        ];
+        // DeepSeek entries first, then the ChatGPT catalogue in config order.
+        let mut expected_ids = vec!["DEFAULT", "EXPERT", "VISION"];
+        expected_ids.extend(config::CHATGPT_MODELS.iter().copied());
         assert_eq!(ids, expected_ids);
 
         // Verify shape and ownership
@@ -4058,6 +4046,7 @@ mod tests {
         let Json(val_enabled) = models(State(state)).await;
         assert_eq!(val_enabled["object"], "list");
         let data_enabled = val_enabled["data"].as_array().unwrap();
-        assert_eq!(data_enabled.len(), 12);
+        // DeepSeek is configured in this state, so 3 base + the ChatGPT catalogue.
+        assert_eq!(data_enabled.len(), 3 + config::CHATGPT_MODELS.len());
     }
 }
