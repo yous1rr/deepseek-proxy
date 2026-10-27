@@ -13,6 +13,8 @@ pow = { path = "../pow" }
 protocol = { path = "../protocol" }
 client = { path = "../client" }
 responses-core = { path = "../responses-core" }
+chatgpt-client = { path = "../chatgpt-client" }
+chatgpt-protocol = { path = "../chatgpt-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }

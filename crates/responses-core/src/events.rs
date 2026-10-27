@@ -9,6 +9,7 @@
 use crate::ids::{new_id, unix_seconds};
 use crate::plan::TurnPlan;
 use crate::transcript::{Item, Part, Role};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 /// One encoded stream event: its `type` and full JSON payload.
@@ -47,6 +48,59 @@ impl Usage {
     }
 }
 
+/// A hosted Responses tool kind produced by an upstream channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostedToolKind {
+    WebSearch,
+    ImageGeneration,
+    CodeInterpreter,
+}
+
+impl HostedToolKind {
+    fn item_type(self) -> &'static str {
+        match self {
+            Self::WebSearch => "web_search_call",
+            Self::ImageGeneration => "image_generation_call",
+            Self::CodeInterpreter => "code_interpreter_call",
+        }
+    }
+}
+
+/// A source attached to a hosted web-search result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedSource {
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+/// A file emitted by a hosted code or artifact tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedFile {
+    pub filename: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+/// A completed hosted-tool result supplied by a channel adapter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostedToolResult {
+    pub kind: HostedToolKind,
+    pub id: String,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<HostedSource>,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub output: Option<Value>,
+    #[serde(default)]
+    pub files: Vec<HostedFile>,
+}
+
 #[derive(Debug, Clone)]
 enum Slot {
     Reasoning {
@@ -64,6 +118,11 @@ enum Slot {
         call_id: String,
         name: String,
         arguments: String,
+    },
+    Hosted {
+        id: String,
+        result: HostedToolResult,
+        done: bool,
     },
 }
 
@@ -102,6 +161,7 @@ impl Slot {
                 "name": name,
                 "arguments": arguments,
             }),
+            Self::Hosted { id, result, done } => hosted_item(id, result, *done),
         }
     }
 
@@ -109,7 +169,45 @@ impl Slot {
         match self {
             Self::Reasoning { done, .. } | Self::Message { done, .. } => *done,
             Self::Call { .. } => true,
+            Self::Hosted { done, .. } => *done,
         }
+    }
+}
+
+fn hosted_item(id: &str, result: &HostedToolResult, done: bool) -> Value {
+    let status = if done { "completed" } else { "in_progress" };
+    match result.kind {
+        HostedToolKind::WebSearch => {
+            let query = result.query.clone().unwrap_or_default();
+            let mut action = json!({
+                "type": "search",
+                "query": query,
+                "queries": [query],
+            });
+            if !result.sources.is_empty() {
+                action["sources"] = json!(result
+                    .sources
+                    .iter()
+                    .filter_map(|source| {
+                        (!source.url.is_empty()).then(|| json!({"type": "url", "url": source.url}))
+                    })
+                    .collect::<Vec<_>>());
+            }
+            json!({"id": id, "type": result.kind.item_type(), "status": status, "action": action})
+        }
+        HostedToolKind::ImageGeneration => json!({
+            "id": id,
+            "type": result.kind.item_type(),
+            "status": status,
+            "result": result.result,
+        }),
+        HostedToolKind::CodeInterpreter => json!({
+            "id": id,
+            "type": result.kind.item_type(),
+            "status": status,
+            "output": result.output,
+            "files": result.files,
+        }),
     }
 }
 
@@ -377,6 +475,76 @@ impl EventEncoder {
         ]
     }
 
+    /// Add a hosted tool output item in progress.
+    pub fn hosted_tool_started(
+        &mut self,
+        kind: HostedToolKind,
+        id: impl Into<String>,
+        metadata: Value,
+    ) -> Vec<StreamEvent> {
+        let id = id.into();
+        let result = HostedToolResult {
+            kind,
+            id: id.clone(),
+            query: metadata
+                .get("query")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            sources: Vec::new(),
+            result: None,
+            output: None,
+            files: Vec::new(),
+        };
+        let index = self.output.len();
+        let item = hosted_item(&id, &result, false);
+        self.output.push(Slot::Hosted {
+            id: id.clone(),
+            result,
+            done: false,
+        });
+        vec![self.emit(
+            "response.output_item.added",
+            json!({"output_index": index, "item": item}),
+        )]
+    }
+
+    /// Complete a hosted tool item and return its terminal output event.
+    pub fn hosted_tool_completed(&mut self, result: HostedToolResult) -> Vec<StreamEvent> {
+        let Some(index) = self
+            .output
+            .iter()
+            .position(|slot| matches!(slot, Slot::Hosted { id, .. } if id == &result.id))
+        else {
+            let index = self.output.len();
+            let item = hosted_item(&result.id, &result, true);
+            self.output.push(Slot::Hosted {
+                id: result.id.clone(),
+                result,
+                done: true,
+            });
+            return vec![self.emit(
+                "response.output_item.done",
+                json!({"output_index": index, "item": item}),
+            )];
+        };
+        let item = match &mut self.output[index] {
+            Slot::Hosted {
+                result: current,
+                done,
+                ..
+            } => {
+                *current = result;
+                *done = true;
+                hosted_item(&current.id, current, true)
+            }
+            _ => unreachable!(),
+        };
+        vec![self.emit(
+            "response.output_item.done",
+            json!({"output_index": index, "item": item}),
+        )]
+    }
+
     /// Close open items, append function calls and record usage.
     ///
     /// Does not emit the terminal event: call [`Self::completed_response`],
@@ -485,6 +653,7 @@ impl EventEncoder {
                     name: name.clone(),
                     arguments: arguments.clone(),
                 }),
+                Slot::Hosted { .. } => None,
             })
             .collect()
     }
@@ -634,5 +803,39 @@ mod tests {
         assert_eq!(snapshot["parallel_tool_calls"], false);
         assert_eq!(snapshot["tool_choice"], "auto");
         assert_eq!(snapshot["store"], true);
+    }
+
+    #[test]
+    fn hosted_tool_items_are_encoded_in_the_completed_response() {
+        let mut encoder = encoder(json!({"input": "search this", "stream": true}));
+        encoder.start();
+        let started = encoder.hosted_tool_started(
+            HostedToolKind::WebSearch,
+            "ws_test",
+            json!({"query": "Rust release"}),
+        );
+        assert_eq!(started[0].kind, "response.output_item.added");
+        let completed = encoder.hosted_tool_completed(HostedToolResult {
+            kind: HostedToolKind::WebSearch,
+            id: "ws_test".into(),
+            query: Some("Rust release".into()),
+            sources: vec![HostedSource {
+                title: "Rust".into(),
+                url: "https://www.rust-lang.org".into(),
+                snippet: None,
+            }],
+            result: None,
+            output: None,
+            files: Vec::new(),
+        });
+        assert_eq!(completed[0].kind, "response.output_item.done");
+        let response = encoder.completed_response();
+        assert_eq!(response["output"][0]["type"], "web_search_call");
+        assert_eq!(response["output"][0]["status"], "completed");
+        assert_eq!(response["output"][0]["action"]["query"], "Rust release");
+        assert_eq!(
+            response["output"][0]["action"]["sources"][0]["url"],
+            "https://www.rust-lang.org"
+        );
     }
 }

@@ -1124,6 +1124,7 @@ mod tests {
             instructions: None,
             transcript,
             tools: Vec::new(),
+            hosted_tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: true,
             reasoning_effort: None,
