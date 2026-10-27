@@ -86,15 +86,23 @@ ChatGPT Web 通过 `ResponsesChannel` 接入，并按模型与 DeepSeek 渠道�
 | 能力 | 提供方 / 方式 |
 |---|---|
 | `text`、`streaming`、`non_streaming` | ChatGPT Web conversation SSE / `response` patch re-encoded |
-| `reasoning` | ChatGPT Web `thought`/隐藏 channel 过滤后的 reasoning delta |
+| `function_tools`、`tool_choice` | proxy：`tool-engine` 的提示词 dialect，与 DeepSeek 渠道共用同一套解析、schema 校验和修复状态机 |
+| `max_output_tokens` | proxy：`[channels.chatgpt_web] max_output_tokens` 本地预算；截断的回合不执行工具调用 |
 | `image_input` | `/backend-api/files` 上传并注入 `file-service://` asset pointer |
 | `web_search` | `system_hints: ["search"]`、搜索源轮询、`web_search_call` output item |
 | `image_generation` | `async_task_type=image_gen`、安全文件轮询、`image_generation_call` Base64 result |
 | `stored_responses`、`previous_response` | proxy 本地 transcript replay；上游不伪造 cursor |
 
-ChatGPT access token 只从 `CHATGPT_TOKEN_<n>`/`CHATGPT_ACCESS_TOKEN_<n>` 环境变量读取。配置了有效 token 后，`GET /v1/models` 才广告 `auto`、`gpt-5*`、`gpt-image-2` 和 `codex-gpt-image-2`；没有 token 时不会把不可用模型放进目录。`code_interpreter` 仍由能力门控拒绝，直到有可靠的沙箱事件映射。
+`reasoning` 声明为 `thinking_effort_only`：请求侧的 `thinking_effort` 会送到上游，但可见消息过滤只放行 `final` channel，`ConversationEvent::ReasoningDelta` 目前不会被构造，因此没有 reasoning 文本。等隐藏 channel → reasoning 的映射落地后再改成如实支持。
+
+工具调用没有上游原生支持，因此复用了 DeepSeek 那套提示词 dialect：协议注入 system 消息，历史调用按 `<invoke name="tool">{json}</invoke>` 回放，工具结果渲染成 user 消息。修复回合不需要 cursor —— 每次请求都重发完整 `messages`，所以纠正就是「追加模型的失败回答 + 纠正提示，再发一次」，代价是每个修复回合多一次完整对话请求。
+
+两者共用的是 `crates/tool-engine`：`dialect` 负责教学文本、提取、schema 校验和流式过滤，`recovery` 负责 accept/repair 状态机与 `ToolPolicy`。该 crate 不做 IO、不持有会话，所以「纠正回合怎么送达」仍由各渠道自己决定。
+
+账号两条来源：`CHATGPT_TOKEN_<n>`/`CHATGPT_ACCESS_TOKEN_<n>` 环境变量，以及 `deepseek-rs chatgpt add` 写入的 `chatgpt_accounts` 表。同一身份以数据库行为准（它带 `expires_at`）。这两个来源都不会自动续期：网页会话只签发 access token，没有 refresh token。代理按 JWT 的 `exp`（不验签）在 72h/24h/2h 三档告警，通过 Bark（`BARK_URL`/`BARK_KEY`）推送或落日志；每档每个账号只发一次。配置了上述任一来源后，`GET /v1/models` 才广告 `auto`、`gpt-5*`、`gpt-image-2` 和 `codex-gpt-image-2`。`code_interpreter` 仍由能力门控拒绝，直到有可靠的沙箱事件映射。
 
 Rust 客户端使用 `reqwest`/rustls，并明确不声称复现 `curl_cffi` 的 Chrome TLS ClientHello 指纹；若上游要求浏览器指纹，需单独替换传输层。PoW 使用 SHA3-512 原生实现，Turnstile 只执行固定的 allowlisted bytecode 子集，不执行任意 JavaScript。
+
 ## 接入新渠道
 
 1. 在 `crates/proxy/src/responses/` 下新建模块并实现 `ResponsesChannel`：

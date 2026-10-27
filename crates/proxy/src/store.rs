@@ -50,6 +50,44 @@ pub struct AccountRow {
     pub created_at: i64,
 }
 
+/// One persisted ChatGPT Web account.
+///
+/// There is no refresh token to store: the ChatGPT web session only yields an
+/// access token, so `expires_at` (decoded from the token) is the only way to
+/// warn before it stops working.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChatGptAccountRow {
+    pub id: String,
+    pub label: Option<String>,
+    pub email: Option<String>,
+    pub plan: Option<String>,
+    pub access_token: String,
+    pub expires_at: Option<i64>,
+    pub proxy_url: Option<String>,
+    pub notified_stage: Option<String>,
+    pub notified_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl std::fmt::Debug for ChatGptAccountRow {
+    /// The access token is a live credential; it never appears in a log line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatGptAccountRow")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("email", &self.email)
+            .field("plan", &self.plan)
+            .field("access_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "[REDACTED]"))
+            .field("notified_stage", &self.notified_stage)
+            .field("notified_at", &self.notified_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
 /// One persisted Responses resource, scoped to a caller identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseRecord {
@@ -80,6 +118,7 @@ pub struct DbCounts {
     pub api_keys: i64,
     pub accounts: i64,
     pub cached_tokens: i64,
+    pub chatgpt_accounts: i64,
 }
 
 #[derive(Debug, Error)]
@@ -169,8 +208,28 @@ impl Store {
                  transcript_json TEXT NOT NULL,
                  created_at INTEGER NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS responses_owner_created
-                 ON responses(owner_id, created_at DESC);",
+            -- ChatGPT Web accounts added with the CLI. The access token is a
+            -- bearer credential with no refresh path, so `expires_at` (decoded
+            -- from the token itself) is what lets the proxy warn before the
+            -- account silently stops working. `notified_*` dedupes the warning
+            -- so one account does not alert on every sweep.
+            CREATE TABLE IF NOT EXISTS chatgpt_accounts (
+                id                TEXT PRIMARY KEY,
+                label             TEXT,
+                email             TEXT,
+                plan              TEXT,
+                access_token      TEXT NOT NULL,
+                expires_at        INTEGER,
+                proxy_url         TEXT,
+                notified_stage    TEXT,
+                notified_at       INTEGER,
+                created_at        INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS chatgpt_accounts_expiry
+                ON chatgpt_accounts(expires_at);
+            CREATE INDEX IF NOT EXISTS responses_owner_created
+                ON responses(owner_id, created_at DESC);",
         )?;
         Ok(())
     }
@@ -288,6 +347,89 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Every ChatGPT Web account, oldest first.
+    pub fn chatgpt_accounts(&self) -> Result<Vec<ChatGptAccountRow>, StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, label, email, plan, access_token, expires_at, proxy_url,
+                    notified_stage, notified_at, created_at, updated_at
+             FROM chatgpt_accounts ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ChatGptAccountRow {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                email: r.get(2)?,
+                plan: r.get(3)?,
+                access_token: r.get(4)?,
+                expires_at: r.get(5)?,
+                proxy_url: r.get(6)?,
+                notified_stage: r.get(7)?,
+                notified_at: r.get(8)?,
+                created_at: r.get(9)?,
+                updated_at: r.get(10)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Insert or replace one ChatGPT Web account.
+    pub fn upsert_chatgpt_account(&self, account: &ChatGptAccountRow) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        conn.execute(
+            "INSERT INTO chatgpt_accounts
+                 (id, label, email, plan, access_token, expires_at, proxy_url,
+                  notified_stage, notified_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch())
+             ON CONFLICT(id) DO UPDATE SET
+                 label          = excluded.label,
+                 email          = COALESCE(excluded.email, chatgpt_accounts.email),
+                 plan           = COALESCE(excluded.plan, chatgpt_accounts.plan),
+                 access_token   = excluded.access_token,
+                 expires_at     = COALESCE(excluded.expires_at, chatgpt_accounts.expires_at),
+                 proxy_url      = excluded.proxy_url,
+                 notified_stage = excluded.notified_stage,
+                 notified_at    = excluded.notified_at,
+                 updated_at     = unixepoch()",
+            params![
+                account.id,
+                account.label,
+                account.email,
+                account.plan,
+                account.access_token,
+                account.expires_at,
+                account.proxy_url,
+                account.notified_stage,
+                account.notified_at,
+                account.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an account by id. True when a row was deleted.
+    pub fn delete_chatgpt_account(&self, id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let n = conn.execute("DELETE FROM chatgpt_accounts WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// Record that the expiry warning for `stage` was delivered.
+    pub fn record_chatgpt_notice(&self, id: &str, stage: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        conn.execute(
+            "UPDATE chatgpt_accounts
+             SET notified_stage = ?2, notified_at = unixepoch()
+             WHERE id = ?1",
+            params![id, stage],
+        )?;
+        Ok(())
+    }
+
     pub fn api_keys(&self) -> Result<Vec<ApiKeyRow>, StoreError> {
         let conn = self.conn.lock().expect("store lock poisoned");
         let mut stmt = conn.prepare(
@@ -329,6 +471,7 @@ impl Store {
             api_keys: one("SELECT COUNT(*) FROM api_keys")?,
             accounts: one("SELECT COUNT(*) FROM accounts")?,
             cached_tokens: one("SELECT COUNT(*) FROM account_tokens")?,
+            chatgpt_accounts: one("SELECT COUNT(*) FROM chatgpt_accounts")?,
         })
     }
 

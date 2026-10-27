@@ -438,6 +438,7 @@ pub async fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "check" => check().await,
         "accounts" | "account" => accounts(sub, args),
         "keys" | "key" => keys(sub, args),
+        "chatgpt" | "cg" => chatgpt(sub, args),
         other => {
             eprintln!("unknown command '{other}'\n");
             usage();
@@ -853,12 +854,14 @@ async fn check() -> Result<i32, Box<dyn std::error::Error>> {
     }
     let n = accounts.len();
     let pool = crate::connect_pool(&cfg, &store, accounts).await?;
-    {
-        let conn = pool.any();
+    if let Some(conn) = pool.any() {
         conn.client()
             .await
             .pow_challenge(client::COMPLETION_PATH)
             .await?;
+    } else {
+        eprintln!("no DeepSeek account configured");
+        return Ok(1);
     }
     println!("ok: {n} account(s), login + PoW verified");
     Ok(0)
@@ -978,6 +981,195 @@ fn accounts(sub: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error
     }
 }
 
+/// `deepseek-rs chatgpt <list|add|rm|check>`.
+///
+/// Secrets are only ever read from stdin (`-`) or a file, never from argv, so
+/// they cannot leak through shell history or a process listing.
+fn chatgpt(sub: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use crate::chatgpt_accounts as accounts_mod;
+    use crate::store::ChatGptAccountRow;
+
+    let cfg = cfg_or_exit();
+    let store = open_store(&cfg)?;
+    let now = accounts_mod::now();
+
+    match sub {
+        "" | "list" | "ls" => {
+            let rows = store.chatgpt_accounts()?;
+            if rows.is_empty() {
+                println!("no ChatGPT accounts configured");
+                println!("add one:  deepseek-rs chatgpt add --access-token -");
+                return Ok(0);
+            }
+            println!(
+                "{:<16} {:<18} {:<8} {:<9} {:<16}  {}",
+                "id", "label", "plan", "alert", "expires in", "added"
+            );
+            for r in rows {
+                println!(
+                    "{:<16} {:<18} {:<8} {:<9} {:<16}  {}",
+                    r.id,
+                    r.label.clone().or(r.email.clone()).unwrap_or_default(),
+                    r.plan.clone().unwrap_or_else(|| "-".into()),
+                    r.notified_stage.clone().unwrap_or_else(|| "-".into()),
+                    accounts_mod::describe_expiry(r.expires_at, now),
+                    fmt_unix(r.created_at)
+                );
+            }
+            println!();
+            println!("Set BARK_URL or BARK_KEY to receive expiry pushes.");
+            Ok(0)
+        }
+        "add" => {
+            let mut token = None;
+            let mut label = None;
+            let mut proxy = None;
+            // args: [exe, chatgpt, add, ...options]
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--access-token" | "-t" => {
+                        i += 1;
+                        token = args.get(i).cloned();
+                        if token.is_none() {
+                            eprintln!("--access-token needs a value (use - for stdin)");
+                            return Ok(2);
+                        }
+                    }
+                    "--label" | "-l" => {
+                        i += 1;
+                        label = args.get(i).cloned();
+                    }
+                    "--proxy" => {
+                        i += 1;
+                        proxy = args.get(i).cloned();
+                    }
+                    other => {
+                        eprintln!("unexpected argument '{other}'");
+                        return Ok(2);
+                    }
+                }
+                i += 1;
+            }
+            let Some(token) = token else {
+                eprintln!("usage: deepseek-rs chatgpt add --access-token <token|-> [--label L] [--proxy URL]");
+                return Ok(2);
+            };
+            let token = if token == "-" {
+                let mut buffer = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+                buffer
+            } else {
+                token
+            };
+            let token = token.trim().to_string();
+            if token.is_empty() || token.chars().any(char::is_control) {
+                eprintln!("empty or invalid token");
+                return Ok(2);
+            }
+            let times = accounts_mod::token_times(&token);
+            let id = accounts_mod::account_id(&token);
+            if let Some(expires) = times.expires_at {
+                if expires <= now {
+                    eprintln!(
+                        "warning: this token expired {} ago",
+                        accounts_mod::describe_expiry(times.expires_at, now)
+                    );
+                }
+            } else {
+                eprintln!("warning: the token carries no exp claim, so expiry cannot be tracked");
+            }
+            let created = store
+                .chatgpt_accounts()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .map(|row| row.created_at)
+                .unwrap_or(now);
+            store.upsert_chatgpt_account(&ChatGptAccountRow {
+                id: id.clone(),
+                label,
+                email: accounts_mod::token_email(&token),
+                plan: None,
+                access_token: token,
+                expires_at: times.expires_at,
+                proxy_url: proxy,
+                notified_stage: None,
+                notified_at: None,
+                created_at: created,
+                updated_at: now,
+            })?;
+            println!("added {id}");
+            println!(
+                "expires in {}",
+                accounts_mod::describe_expiry(times.expires_at, now)
+            );
+            println!("restart to apply: deepseek-rs restart");
+            Ok(0)
+        }
+        "rm" | "remove" | "delete" => {
+            let Some(target) = args.get(3) else {
+                eprintln!("usage: deepseek-rs chatgpt rm <id|label>");
+                return Ok(2);
+            };
+            let rows = store.chatgpt_accounts()?;
+            let found = rows.into_iter().find(|row| {
+                &row.id == target
+                    || row.label.as_deref() == Some(target.as_str())
+                    || row.email.as_deref() == Some(target.as_str())
+            });
+            let Some(row) = found else {
+                eprintln!("no ChatGPT account matches '{target}'");
+                return Ok(3);
+            };
+            store.delete_chatgpt_account(&row.id)?;
+            println!("removed {}", row.id);
+            println!("restart to apply: deepseek-rs restart");
+            Ok(0)
+        }
+        "check" => {
+            // Report expiry only: there is no refresh path, so a probe cannot
+            // extend an account, and calling upstream would only cost a turn.
+            let rows = store.chatgpt_accounts()?;
+            if rows.is_empty() {
+                eprintln!("no ChatGPT accounts configured");
+                return Ok(1);
+            }
+            let bark = accounts_mod::Bark::from_env();
+            for row in rows {
+                let stage = accounts_mod::due_stage(&row, now);
+                println!(
+                    "{:<16} {:<18} expires in {}{}",
+                    row.id,
+                    row.label.clone().or(row.email.clone()).unwrap_or_default(),
+                    accounts_mod::describe_expiry(row.expires_at, now),
+                    match stage {
+                        Some(stage) => format!("  (alert due: {stage})"),
+                        None => String::new(),
+                    }
+                );
+            }
+            println!();
+            println!(
+                "bark: {}",
+                if bark.is_some() {
+                    "configured"
+                } else {
+                    "not configured (set BARK_URL or BARK_KEY)"
+                }
+            );
+            println!(
+                "the server sweeps expiries periodically; no refresh path exists for these tokens"
+            );
+            Ok(0)
+        }
+        other => {
+            eprintln!("unknown chatgpt subcommand '{other}'");
+            eprintln!("usage: deepseek-rs chatgpt [list|add|rm|check]");
+            Ok(2)
+        }
+    }
+}
+
 fn keys(sub: &str, args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let cfg = cfg_or_exit();
     let store = open_store(&cfg)?;
@@ -1067,11 +1259,20 @@ ACCOUNTS  (stored in {db}; env vars still work and win)
   accounts add <email> --token <token>
   accounts rm <email>         remove account + its cached token
 
+CHATGPT WEB ACCOUNTS  (stored in {db}; env CHATGPT_TOKEN_<n> still works)
+  chatgpt                     list accounts, expiry and last alert
+  chatgpt add --access-token <token|->   read from stdin with '-'
+      [--label L] [--proxy URL]
+  chatgpt rm <id|label>       remove an account
+  chatgpt check               show remaining life and whether Bark is set
+
+  No refresh path exists for these tokens: set BARK_URL or BARK_KEY and the
+  server pushes a warning at 72h, 24h and 2h before expiry.
+
 API KEYS
   keys                        list registered keys
   keys add <name> <key>       register a key (alias: key <name> <key>)
   keys rm <name|id>           revoke a key
-
 MISC
   check                       verify login + PoW for every account, exit
   url                         print the OpenAI base URL
@@ -1091,7 +1292,9 @@ ENVIRONMENT
   QUEUE_LIMIT               max queued requests per account (default 64)
   THINKING_ENABLED / SEARCH_ENABLED
   DEEPSEEK_EMAIL_<i> / DEEPSEEK_PASSWORD_<i> / DEEPSEEK_TOKEN_<i>
-                            accounts from the environment, checked in order",
+                            accounts from the environment, checked in order
+  CHATGPT_TOKEN_<i>         ChatGPT Web access token (cannot be refreshed)
+  BARK_URL / BARK_KEY       push endpoint for token-expiry warnings",
         version = env!("CARGO_PKG_VERSION"),
         lines = DEFAULT_LOG_LINES,
         db = cfg_or_exit().db_path,

@@ -431,9 +431,12 @@ pub enum RouteError {
     /// Every configured account is cooling down, so nothing can be assigned.
     NoHealthyAccount {
         /// Remaining cooldown of the account that recovers first, in ms.
-        /// `None` when the pool has no accounts at all.
         retry_after_ms: Option<u64>,
     },
+    /// No DeepSeek account is configured at all: the channel is disabled, not
+    /// busy, so a caller should answer `channel_unavailable` rather than a
+    /// retry hint.
+    NotConfigured,
 }
 
 impl fmt::Display for RouteError {
@@ -446,6 +449,7 @@ impl fmt::Display for RouteError {
                 }
                 Ok(())
             }
+            RouteError::NotConfigured => f.write_str("no DeepSeek account is configured"),
         }
     }
 }
@@ -495,11 +499,15 @@ impl Pool {
         config: PoolConfig,
         store: crate::store::Store,
     ) -> Result<Self, String> {
-        if accounts.is_empty() {
-            return Err("no DeepSeek accounts configured".into());
-        }
         let mut config = config;
         config.max_inflight_per_account = config.max_inflight_per_account.max(1);
+        // Zero DeepSeek accounts is a supported deployment when another channel
+        // (ChatGPT Web) serves the traffic, so build an empty pool instead of
+        // refusing to start.
+        if accounts.is_empty() {
+            return Ok(Self::unconfigured(config, store));
+        }
+
         let mut conns = Vec::new();
         for a in accounts {
             let conn = Connection::new(
@@ -530,14 +538,38 @@ impl Pool {
         })
     }
 
+    /// A pool with no accounts.
+    ///
+    /// Traffic from another channel can still be served; every DeepSeek route
+    /// then fails with [`RouteError::NotConfigured`] so the caller can answer a
+    /// clean 503 instead of opening a session nobody can serve.
+    pub fn unconfigured(config: PoolConfig, store: crate::store::Store) -> Self {
+        let mut config = config;
+        config.max_inflight_per_account = config.max_inflight_per_account.max(1);
+        Self {
+            conns: Vec::new(),
+            owner: Mutex::new(HashMap::new()),
+            config,
+            store,
+        }
+    }
+
+    /// Whether any DeepSeek account is configured.
+    pub fn is_configured(&self) -> bool {
+        !self.conns.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.conns.len()
     }
 
     /// First account, without binding a thread to it. Used for health probes
     /// that must not leave a fake thread in the database.
-    pub fn any(&self) -> Arc<Connection> {
-        self.conns[0].clone()
+    ///
+    /// `None` when the pool has no accounts: a deployment that only serves
+    /// ChatGPT Web is valid, so a health probe must not panic.
+    pub fn any(&self) -> Option<Arc<Connection>> {
+        self.conns.first().cloned()
     }
 
     #[allow(dead_code)] // used by tests and future admin UI
@@ -606,7 +638,11 @@ impl Pool {
     /// returns to its account once the cooldown expires.
     #[allow(dead_code)] // main.rs will call this instead of `route()`
     pub async fn route_checked(&self, thread_id: &str) -> Result<Arc<Connection>, RouteError> {
-        // 1. In-memory binding, only while its account can serve traffic.
+        // A deployment with no DeepSeek account still serves other channels;
+        // its DeepSeek routes are disabled rather than busy.
+        if self.conns.is_empty() {
+            return Err(RouteError::NotConfigured);
+        }
         let owner_bound = {
             let owner = self.owner.lock().await;
             owner.get(thread_id).copied()
@@ -916,6 +952,7 @@ mod tests {
                 let ms = retry_after_ms.expect("both accounts are cooling down");
                 assert!(ms > 0 && ms <= 60_000, "unexpected retry hint: {ms}");
             }
+            RouteError::NotConfigured => panic!("configured pool cannot return NotConfigured"),
         }
         assert!(
             err.to_string().contains("no healthy account available"),
@@ -968,7 +1005,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conn = pool.any();
+        let conn = pool.any().unwrap();
 
         let ticket1 = conn.acquire().await.expect("first acquire succeeds");
         let acquired_second = Arc::new(tokio::sync::Notify::new());
@@ -1013,7 +1050,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conn = pool.any();
+        let conn = pool.any().unwrap();
 
         let ticket1 = conn.acquire().await.expect("first acquire succeeds");
         let ticket2 = conn
@@ -1063,7 +1100,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conn = pool.any();
+        let conn = pool.any().unwrap();
 
         // 1. Success path: waiting returns to 0
         {
@@ -1150,7 +1187,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conn = pool.any();
+        let conn = pool.any().unwrap();
         let barrier = Arc::new(tokio::sync::Barrier::new(4));
         let started = Instant::now();
         let mut handles = Vec::new();
@@ -1193,7 +1230,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conn = pool.any();
+        let conn = pool.any().unwrap();
 
         // Start first request
         let t1 = conn.acquire().await.expect("first acquire succeeds");
@@ -1242,7 +1279,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conn = pool.any();
+        let conn = pool.any().unwrap();
 
         // 1. Acquire ticket1
         let ticket1 = conn.acquire().await.expect("acquire t1");
@@ -1304,7 +1341,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let conn = pool.any();
+        let conn = pool.any().unwrap();
         let first_ticket = conn.acquire().await.expect("first acquire succeeds");
 
         let conn_first = conn.clone();

@@ -17,9 +17,15 @@
 //! thread sends the flattened transcript.
 //!
 
+mod chatgpt_accounts;
 mod cli;
 mod config;
-mod dialect;
+mod dialect {
+    //! The prompted tool dialect lives in its own crate so a second channel can
+    //! share it. Re-exported under the historical `dialect::` path so every
+    //! existing call site keeps working unchanged.
+    pub(crate) use tool_engine::dialect::*;
+}
 mod history;
 mod images;
 mod log;
@@ -87,6 +93,7 @@ struct ThreadState {
 
 #[derive(Clone)]
 struct AppState {
+    /// The DeepSeek channel may be absent while other channels remain live.
     pool: Arc<pool::Pool>,
     settings: Settings,
     threads: Arc<Mutex<HashMap<String, ThreadState>>>,
@@ -750,11 +757,23 @@ async fn stats(State(state): State<AppState>) -> Json<Value> {
         "db": {
             "threads": counts.threads,
             "bindings": counts.bindings,
-            "api_keys": counts.api_keys,
-            "accounts": counts.accounts,
-            "cached_tokens": counts.cached_tokens,
+            "chatgpt_accounts": counts.chatgpt_accounts,
+        },
+        "channels": {
+            "deepseek_web": { "available": state.pool.is_configured(), "accounts": accounts.len() },
+            "chatgpt_web": { "available": counts.chatgpt_accounts > 0 || get_chatgpt_config().should_advertise_models() },
         },
         "accounts": accounts,
+        "chatgpt_accounts": state.store.chatgpt_accounts().unwrap_or_default().into_iter().map(|row| {
+            json!({
+                "id": row.id,
+                "label": row.label,
+                "email": row.email,
+                "expires_at": row.expires_at,
+                "expires_in": row.expires_at.map(|value| value - crate::chatgpt_accounts::now()),
+                "last_alert": row.notified_stage,
+            })
+        }).collect::<Vec<_>>(),
     }))
 }
 
@@ -778,13 +797,8 @@ pub fn get_chatgpt_config() -> config::ChatGptConfig {
         .unwrap_or_default()
 }
 
-/// Build the list of advertised models based on current ChatGPT configuration.
-///
-/// Returns existing base entries (`DEFAULT`, `EXPERT`, `VISION`) plus ChatGPT entries
-/// when the ChatGPT Web channel is enabled and has valid tokens configured.
-/// The list is deduplicated, returned in stable order, and matches the Google/OpenAI shape
-/// (`object=list`, `id/object/created/owned_by`).
-pub(crate) fn build_models_list(chatgpt: &config::ChatGptConfig) -> Value {
+/// Build the advertised model list for the active channels.
+pub(crate) fn build_models_list(chatgpt: &config::ChatGptConfig, deepseek: bool) -> Value {
     let mut entries = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -793,15 +807,16 @@ pub(crate) fn build_models_list(chatgpt: &config::ChatGptConfig) -> Value {
         ("EXPERT", "deepseek"),
         ("VISION", "deepseek"),
     ];
-
-    for (id, owner) in base_models {
-        if seen.insert(id.to_string()) {
-            entries.push(json!({
-                "id": id,
-                "object": "model",
-                "created": 0,
-                "owned_by": owner,
-            }));
+    if deepseek {
+        for (id, owner) in base_models {
+            if seen.insert(id.to_string()) {
+                entries.push(json!({
+                    "id": id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": owner,
+                }));
+            }
         }
     }
 
@@ -824,9 +839,22 @@ pub(crate) fn build_models_list(chatgpt: &config::ChatGptConfig) -> Value {
     })
 }
 
-/// `GET /v1/models` — current entries plus ChatGPT entries when enabled.
-async fn models(_state: State<AppState>) -> Json<Value> {
-    Json(build_models_list(&get_chatgpt_config()))
+/// `GET /v1/models` — advertise only channels that have credentials.
+async fn models(State(state): State<AppState>) -> Json<Value> {
+    let chatgpt = get_chatgpt_config();
+    let has_stored_chatgpt = state
+        .store
+        .chatgpt_accounts()
+        .map(|rows| !rows.is_empty())
+        .unwrap_or(false);
+    let mut effective = chatgpt;
+    if has_stored_chatgpt && effective.tokens.is_empty() {
+        // Stored account credentials are added by the startup loader; reflect
+        // that here as well so model discovery matches the active channel.
+        effective.enabled = true;
+        effective.tokens.push("stored".into());
+    }
+    Json(build_models_list(&effective, state.pool.is_configured()))
 }
 
 /// Reject the request unless the bearer key is known (or none are registered).
@@ -1081,187 +1109,37 @@ async fn completion_with_retry(
     }
 }
 
-/// Run correction turns for malformed tool calls.
+use tool_engine::{Recovery, ToolError, ToolPolicy};
+
+/// Resolve a request's tools and its `tool_choice` narrowing.
 ///
-/// Port of the repair loop in `deepseek_proxy/service.py`, including the two
-/// subtleties that took a bug to find there:
-///
-/// - a repaired call that repeats an already-accepted call is dropped, because
-///   the model tends to echo the block it was just told about;
-/// - an attempt that resolves nothing records ONE `repair_omitted_call` marker
-///   instead of re-listing the same failures. Re-listing grows `expected` every
-///   attempt until the retry budget is gone.
-///
-/// Repair turns are non-streaming and never carry thinking/search, matching
-/// `turn.generate(repair_prompt, stream=False)`.
-/// Port of `deepseek_proxy/tools/recovery.py::Recovery`.
-///
-/// The validation and recovery policy is not "does the block parse?" — every
-/// call is checked against the offered tool's JSON Schema before it is
-/// accepted, on the first turn as well as during repair. A call that names an
-/// unknown tool, whose arguments are not a JSON object, or whose arguments do
-/// not match the schema is converted into a repair failure instead of being
-/// forwarded to the client.
-struct Recovery {
-    specs: Vec<dialect::ToolSpec>,
-    calls: Vec<dialect::ToolCall>,
-    pending: Vec<dialect::MalformedCall>,
-    required: bool,
-    parallel: bool,
-    previous: HashMap<(String, String), usize>,
-    repair_seen: HashMap<(String, String), usize>,
-    expected: usize,
-    resolved: usize,
-    repairing: bool,
-}
-
-impl Recovery {
-    fn new(specs: Vec<dialect::ToolSpec>, required: bool, parallel: bool) -> Self {
-        Self {
-            specs,
-            calls: Vec::new(),
-            pending: Vec::new(),
-            required,
-            parallel,
-            previous: HashMap::new(),
-            repair_seen: HashMap::new(),
-            expected: 0,
-            resolved: 0,
-            repairing: false,
-        }
-    }
-
-    /// Feed one event; returns the calls it produced (zero or one).
-    ///
-    /// Mirrors `Recovery.accept()`: malformed events join `pending`, text is
-    /// ignored, and a parsed call is schema-validated before acceptance.
-    fn accept(
-        &mut self,
-        event: dialect::ScanEvent,
-    ) -> Result<Option<dialect::ToolCall>, ProxyError> {
-        let call = match event {
-            dialect::ScanEvent::Malformed(m) => {
-                self.pending.push(m);
-                return Ok(None);
-            }
-            dialect::ScanEvent::Text(_) => return Ok(None),
-            dialect::ScanEvent::Tool(c) => c,
-        };
-
-        if let Some(reason) = dialect::validation_reason(&self.specs, &call) {
-            self.pending.push(dialect::MalformedCall::new(
-                Some(call.name.clone()),
-                call.arguments.clone(),
-                reason,
-            ));
-            return Ok(None);
-        }
-
-        let key = dialect::fingerprint(&call);
-        if self.repairing {
-            let seen = self.repair_seen.entry(key.clone()).or_insert(0);
-            *seen += 1;
-            let before = self.previous.get(&key).copied().unwrap_or(0);
-            if *seen <= before {
-                // The repair echoed a previously accepted call.
-                return Ok(None);
-            }
-        }
-        if !self.parallel && !self.calls.is_empty() {
-            return Err(ProxyError::new(
-                "Backend produced multiple calls with parallel_tool_calls=false",
-                axum::http::StatusCode::BAD_GATEWAY,
-                "tool_repair_failed",
-            ));
-        }
-        self.calls.push(call.clone());
-        self.resolved += 1;
-        Ok(Some(call))
-    }
-
-    /// `tool_choice: "required"` must yield at least one call.
-    fn require_call(&mut self) {
-        if self.required && self.calls.is_empty() && self.pending.is_empty() {
-            self.pending.push(dialect::MalformedCall::new(
-                None,
-                String::new(),
-                "required_tool_call_missing",
-            ));
-        }
-    }
-
-    /// Port of `begin_repair()`: build the prompt and reset the per-attempt
-    /// counters. `previous` snapshots every call accepted so far, so the next
-    /// repair cannot re-accept an echo of one of them.
-    fn begin_repair(&mut self) -> String {
-        let mut prompt = dialect::build_repair_prompt(&self.pending, &self.specs);
-        // Only the schema of a tool the model actually named and got wrong on
-        // its arguments. Sending the whole catalogue here makes a repair turn
-        // larger than the turn it repairs — in exactly the situation (context
-        // pressure) where repair is most likely needed.
-        let schemas = dialect::repair_schemas(&self.pending, &self.specs);
-        if !schemas.is_empty() {
-            prompt.push_str("\nSchema(s) for the tool call(s) that failed:\n");
-            prompt.push_str(&dialect::py_json_dumps(&Value::Array(schemas)));
-        }
-        self.expected = self.pending.len();
-        self.pending.clear();
-        self.resolved = 0;
-        self.previous.clear();
-        for call in &self.calls {
-            *self.previous.entry(dialect::fingerprint(call)).or_insert(0) += 1;
-        }
-        self.repair_seen.clear();
-        self.repairing = true;
-        prompt
-    }
-
-    /// Port of `end_repair()`: an attempt that resolved nothing records exactly
-    /// one omission marker, never the whole failure list again.
-    fn end_repair(&mut self) {
-        if self.resolved < self.expected {
-            self.pending.push(dialect::MalformedCall::new(
-                None,
-                String::new(),
-                "repair_omitted_call",
-            ));
-        }
-    }
-
-    fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-}
-
-/// How `tool_choice` narrows the offered tools and sets the `required` flag.
-///
-/// Port of the filtering at the top of `ChatService.events()`:
-/// `"none"` drops every tool, a named choice keeps only that function and
-/// implies required, and `"required"` keeps all tools and implies required.
+/// The policy is shared with every other prompted-tool channel; this keeps the
+/// historical `ChatRequest`-shaped call site.
 fn resolve_tools(req: &ChatRequest) -> (Vec<dialect::ToolSpec>, bool) {
-    let mut tools = req.tools.clone();
-    let mut required = false;
-    match req.tool_choice.as_ref() {
-        Some(Value::String(s)) if s == "none" => tools.clear(),
-        Some(Value::String(s)) if s == "required" => required = true,
-        Some(Value::Object(obj)) => {
-            if let Some(name) = obj
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-            {
-                tools.retain(|t| {
-                    t.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        == Some(name)
-                });
-                required = true;
-            }
-        }
-        _ => {}
-    }
-    (dialect::tool_specs(&tools), required)
+    let policy = ToolPolicy::resolve(
+        &req.tools,
+        req.tool_choice.as_ref(),
+        req.parallel_tool_calls,
+    );
+    (policy.specs, policy.required)
+}
+
+/// Map a shared tool-policy failure to the client-facing error.
+///
+/// The code and messages are the ones this proxy has always returned; the
+/// policy itself lives in `tool-engine` so every channel reports it the same way.
+fn tool_failure(error: ToolError) -> ProxyError {
+    let (message, code) = match error {
+        ToolError::ParallelCallsDisabled => (
+            "Backend produced multiple calls with parallel_tool_calls=false",
+            "tool_repair_failed",
+        ),
+        ToolError::RepairFailed => (
+            "Could not recover a valid tool response",
+            "tool_repair_failed",
+        ),
+    };
+    ProxyError::new(message, axum::http::StatusCode::BAD_GATEWAY, code)
 }
 
 /// Wait before retry number `attempt` (0-based).
@@ -2288,17 +2166,11 @@ async fn stream_response(
         // policy sees each event exactly once.
         filter.calls.clear();
         let mut recovery = Recovery::new(specs, required, parallel);
-        for event in dialect::scan(&text) {
-            match recovery.accept(event) {
-                Ok(_) => {}
-                Err(e) => {
-                    state.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    fail_turn(&state, &key, &session_id, cursor, &tx, e).await;
-                    return;
-                }
-            }
+        if let Err(error) = recovery.accept_text(&text) {
+            state.stats.errors.fetch_add(1, Ordering::Relaxed);
+            fail_turn(&state, &key, &session_id, cursor, &tx, tool_failure(error)).await;
+            return;
         }
-        recovery.require_call();
 
         // Chain correction turns after the reply we just received: the cursor
         // already points at it, so the repair continues the conversation instead
@@ -2307,14 +2179,14 @@ async fn stream_response(
 
         let max = state.settings.tool_repair_max_retries;
         for attempt in 1..=max {
-            if !recovery.has_pending() {
+            if !recovery.needs_repair() {
                 break;
             }
             if cursor.is_none() {
                 break;
             }
             let prompt = recovery.begin_repair();
-            let expected = recovery.expected;
+            let expected = recovery.expected_count();
             tracing::warn!(thread = %key, attempt, expected, "tool repair");
 
             // The repair goes to whichever session is live right now, parented
@@ -2365,44 +2237,29 @@ async fn stream_response(
             // Missing ids revoke cursor trust; never certify the prior answer
             // as the head of a successful correction turn.
             cursor = repair_mid;
-            for event in dialect::scan(&repair_text) {
-                match recovery.accept(event) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        state.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        fail_turn(&state, &key, &session_id, cursor, &tx, e).await;
-                        return;
-                    }
-                }
+            if let Err(error) = recovery.accept_text(&repair_text) {
+                state.stats.errors.fetch_add(1, Ordering::Relaxed);
+                fail_turn(&state, &key, &session_id, cursor, &tx, tool_failure(error)).await;
+                return;
             }
             recovery.end_repair();
             tracing::debug!(
                 thread = %key,
                 attempt,
-                remaining = recovery.pending.len(),
+                remaining = recovery.pending_count(),
                 "tool repair settled"
             );
         }
 
         // Python raises here rather than returning a turn with no usable calls.
-        if recovery.has_pending() {
-            state.stats.errors.fetch_add(1, Ordering::Relaxed);
-            fail_turn(
-                &state,
-                &key,
-                &session_id,
-                cursor,
-                &tx,
-                ProxyError::new(
-                    "Could not recover a valid tool response",
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "tool_repair_failed",
-                ),
-            )
-            .await;
-            return;
-        }
-        filter.calls = recovery.calls;
+        filter.calls = match recovery.finish() {
+            Ok(calls) => calls,
+            Err(error) => {
+                state.stats.errors.fetch_add(1, Ordering::Relaxed);
+                fail_turn(&state, &key, &session_id, cursor, &tx, tool_failure(error)).await;
+                return;
+            }
+        };
 
         // Flush any held-back prose, then emit tool calls (if any).
         let tail = filter.finish();
@@ -2784,11 +2641,40 @@ fn queue_error(msg: &str) -> Response {
     .into_response()
 }
 
+/// Sweep ChatGPT token expiries forever, once per hour.
+///
+/// The first sweep runs immediately so a restart reports a token that expired
+/// while the process was down. Errors are logged and never stop the loop.
+fn spawn_chatgpt_expiry_watch(store: store::Store) {
+    tokio::spawn(async move {
+        let bark = crate::chatgpt_accounts::Bark::from_env();
+        if bark.is_none() {
+            tracing::info!("BARK_URL/BARK_KEY not set: ChatGPT expiry is logged but never pushed");
+        }
+        loop {
+            let warned = crate::chatgpt_accounts::sweep(&store, bark.as_ref()).await;
+            if !warned.is_empty() {
+                tracing::warn!(accounts = ?warned, "ChatGPT token expiry warning sent");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+    });
+}
+
 fn route_unavailable(err: pool::RouteError) -> ProxyError {
+    if matches!(err, pool::RouteError::NotConfigured) {
+        tracing::warn!("no DeepSeek account is configured; only other channels can serve");
+        return ProxyError::new(
+            "The DeepSeek channel is not configured; add an account or use a ChatGPT model",
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "channel_unavailable",
+        );
+    }
     let retry_after = match err {
         pool::RouteError::NoHealthyAccount { retry_after_ms } => {
             retry_after_ms.map(|ms| ms.div_ceil(1000).max(1))
         }
+        pool::RouteError::NotConfigured => None,
     };
     tracing::warn!(error = %err, "no healthy account available");
     let mut response = ProxyError::new(
@@ -2846,10 +2732,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = store::Store::open_path(&cfg.db_path)?;
 
     let accounts = cli::load_accounts(&store);
+    // A deployment that serves only ChatGPT Web needs no DeepSeek account. It
+    // is still an error when *neither* channel can work, because then the proxy
+    // could accept requests it is guaranteed to fail.
+    let chatgpt_configured = cfg.chatgpt.should_advertise_models()
+        || store
+            .chatgpt_accounts()
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false);
+    if accounts.is_empty() && !chatgpt_configured {
+        return Err("no accounts configured — add a DeepSeek account with \
+             `deepseek-rs accounts add <email> <password>`, or a ChatGPT Web \
+             token with `deepseek-rs chatgpt add --access-token -`"
+            .into());
+    }
     if accounts.is_empty() {
-        return Err(
-            "no DeepSeek accounts configured — add one with `deepseek-rs accounts add <email> <password>`"
-                .into(),
+        tracing::warn!(
+            "no DeepSeek account configured: the DeepSeek channel is disabled, \
+             only ChatGPT Web models are served"
         );
     }
 
@@ -2865,14 +2765,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.request_delay_secs
     );
     let pool = connect_pool(&cfg, &store, accounts).await?;
-    tracing::info!("login ok for {} account(s)", pool.len());
-
-    // Fail fast on a broken PoW path rather than on the first user request.
-    {
-        let conn = pool.any();
-        let client = conn.client().await;
-        client.pow_challenge(COMPLETION_PATH).await?;
-        tracing::info!("pow challenge ok (account {})", conn.email);
+    if pool.is_configured() {
+        tracing::info!("login ok for {} account(s)", pool.len());
+        // Fail fast on a broken PoW path rather than on the first user request.
+        if let Some(conn) = pool.any() {
+            let client = conn.client().await;
+            client.pow_challenge(COMPLETION_PATH).await?;
+            tracing::info!("pow challenge ok (account {})", conn.email);
+        }
     }
 
     let settings = Settings {
@@ -2901,16 +2801,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // only registered when authenticated tokens are configured.
     let mut response_channels: Vec<Arc<dyn responses::channel::ResponsesChannel>> =
         vec![Arc::new(responses::deepseek::DeepSeekWeb)];
-    if cfg.chatgpt.should_advertise_models() {
-        let clients = cfg
-            .chatgpt
-            .tokens
+    // Credentials come from two places: `CHATGPT_TOKEN_<n>` in the environment
+    // and rows added with `deepseek-rs chatgpt add`. The database wins for the
+    // same identity, because a stored row carries expiry metadata.
+    let mut chatgpt_tokens: Vec<(String, Option<String>)> = cfg
+        .chatgpt
+        .tokens
+        .iter()
+        .map(|token| (token.clone(), None))
+        .collect();
+    for row in store.chatgpt_accounts().unwrap_or_default() {
+        chatgpt_tokens.retain(|(token, _)| crate::chatgpt_accounts::account_id(token) != row.id);
+        chatgpt_tokens.push((row.access_token.clone(), row.proxy_url.clone()));
+    }
+    if !chatgpt_tokens.is_empty() {
+        let clients = chatgpt_tokens
             .iter()
-            .map(|token| {
+            .map(|(token, proxy)| {
                 ChatGptClient::new(ClientConfig {
                     base_url: cfg.chatgpt.base_url.clone(),
                     access_token: token.clone(),
-                    proxy_url: cfg.chatgpt.proxy_url.clone(),
+                    proxy_url: proxy.clone().or_else(|| cfg.chatgpt.proxy_url.clone()),
                     timeout: std::time::Duration::from_secs_f64(cfg.chatgpt.timeout_secs),
                 })
             })
@@ -2920,6 +2831,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         response_channels.push(Arc::new(channel));
         tracing::info!(models = ?config::chatgpt_models(), "ChatGPT Web Responses channel enabled");
     }
+
+    // Expiry sweeps: an access token cannot be renewed here, so warn before it
+    // dies. Runs off the request path so a slow push never delays a turn.
+    spawn_chatgpt_expiry_watch(store.clone());
     // A missing, malformed or mismatched capability profile is a startup
     // error: silently falling back could enable features the operator meant
     // to disable.
@@ -3255,7 +3170,7 @@ mod tests {
             }))
             .unwrap();
         assert!(produced.is_none());
-        assert!(recovery.has_pending());
+        assert!(recovery.needs_repair());
         let prompt = recovery.begin_repair();
         assert!(prompt.contains("unknown_or_disallowed_tool"));
         assert!(prompt.contains("Valid tool names: bash."));
@@ -3266,8 +3181,8 @@ mod tests {
         let specs = dialect::tool_specs(&[tool_with_schema()]);
         let mut recovery = Recovery::new(specs, true, true);
         recovery.require_call();
-        assert!(recovery.has_pending());
-        assert_eq!(recovery.pending[0].reason, "required_tool_call_missing");
+        assert!(recovery.needs_repair());
+        assert_eq!(recovery.pending()[0].reason, "required_tool_call_missing");
     }
 
     #[test]
@@ -3280,7 +3195,7 @@ mod tests {
         });
         assert!(recovery.accept(ok.clone()).unwrap().is_some());
         let second = recovery.accept(ok).unwrap_err();
-        assert_eq!(second.code, "tool_repair_failed");
+        assert_eq!(tool_failure(second).code, "tool_repair_failed");
     }
 
     #[test]
@@ -3356,11 +3271,13 @@ mod tests {
         });
         let specs = dialect::tool_specs(&[tool_with_schema(), other]);
         let mut recovery = Recovery::new(specs, false, true);
-        recovery.pending.push(dialect::MalformedCall::new(
-            Some("bash".into()),
-            "{}".into(),
-            "arguments_do_not_match_schema",
-        ));
+        recovery
+            .accept(dialect::ScanEvent::Malformed(dialect::MalformedCall::new(
+                Some("bash".into()),
+                "{}".into(),
+                "arguments_do_not_match_schema",
+            )))
+            .unwrap();
         let prompt = recovery.begin_repair();
         assert!(prompt.contains("Schema(s) for the tool call(s) that failed:"));
         assert!(
@@ -3387,11 +3304,13 @@ mod tests {
             (Some("bash".to_string()), "unterminated_block"),
         ] {
             let mut recovery = Recovery::new(specs.clone(), false, true);
-            recovery.pending.push(dialect::MalformedCall::new(
-                name.clone(),
-                String::new(),
-                reason,
-            ));
+            recovery
+                .accept(dialect::ScanEvent::Malformed(dialect::MalformedCall::new(
+                    name.clone(),
+                    String::new(),
+                    reason,
+                )))
+                .unwrap();
             let prompt = recovery.begin_repair();
             assert!(
                 !prompt.contains("Schema(s) for the tool call(s) that failed:"),
@@ -3419,7 +3338,7 @@ mod tests {
             for event in dialect::scan(text) {
                 recovery.accept(event).expect("malformed is not an error");
             }
-            assert!(!recovery.pending.is_empty(), "{text} must reach repair");
+            assert!(!recovery.pending().is_empty(), "{text} must reach repair");
             let prompt = recovery.begin_repair();
             assert!(
                 prompt.contains("Schema(s) for the tool call(s) that failed:"),
@@ -3732,7 +3651,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert("test-thread".into(), remote.clone());
-        let conn = state.pool.any();
+        let conn = state.pool.any().unwrap();
         let slot = conn.acquire().await.unwrap();
         let resp = reqwest::Response::from(
             axum::http::Response::builder()
@@ -4044,8 +3963,7 @@ mod tests {
             .get_thread_history("test-thread")
             .unwrap()
             .is_none());
-        let conn = state.pool.any();
-        let _slot = conn.acquire().await.unwrap();
+        let conn = state.pool.any().unwrap();
         drop(guard);
     }
 
@@ -4055,7 +3973,7 @@ mod tests {
         let mut chatgpt = config::ChatGptConfig::default();
         chatgpt.enabled = false;
         chatgpt.tokens = vec!["tok-1".into()];
-        let list = build_models_list(&chatgpt);
+        let list = build_models_list(&chatgpt, true);
         assert_eq!(list["object"], "list");
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
@@ -4069,10 +3987,14 @@ mod tests {
         // 2. Channel enabled but no tokens (cannot run anonymously)
         chatgpt.enabled = true;
         chatgpt.tokens = vec![];
-        let list = build_models_list(&chatgpt);
+        let list = build_models_list(&chatgpt, true);
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["DEFAULT", "EXPERT", "VISION"]);
+
+        // 3. With no DeepSeek pool, no DeepSeek model is advertised.
+        let list = build_models_list(&chatgpt, false);
+        assert!(list["data"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -4081,7 +4003,7 @@ mod tests {
         chatgpt.enabled = true;
         chatgpt.tokens = vec!["tok-1".into()];
 
-        let list = build_models_list(&chatgpt);
+        let list = build_models_list(&chatgpt, true);
         assert_eq!(list["object"], "list");
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();

@@ -767,7 +767,6 @@ fn validate_messages(request: &ConversationRequest) -> Result<Vec<Value>, Error>
     for message in &request.messages {
         let mut message = message.clone();
         if !message.is_object()
-            || message.get("id").and_then(Value::as_str).is_none()
             || message
                 .pointer("/author/role")
                 .and_then(Value::as_str)
@@ -784,6 +783,16 @@ fn validate_messages(request: &ConversationRequest) -> Result<Vec<Value>, Error>
                 .is_none()
         {
             return Err(Error::new(ErrorKind::InvalidRequest));
+        }
+        // The web backend requires a message id on every entry. Callers that
+        // build a fresh transcript have no id to supply, so a missing or blank
+        // one is filled here instead of failing the whole turn.
+        if message
+            .get("id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            message["id"] = json!(new_id());
         }
         if !message.get("metadata").is_some_and(Value::is_object) {
             message["metadata"] = json!({});

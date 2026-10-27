@@ -529,10 +529,7 @@ pub fn build_repair_prompt(malformed: &[MalformedCall], specs: &[ToolSpec]) -> S
 ///
 /// The name comes from the model, so an unknown name matches no spec and adds
 /// nothing. Same tool failing twice contributes one schema.
-pub fn repair_schemas(
-    malformed: &[MalformedCall],
-    specs: &[ToolSpec],
-) -> Vec<serde_json::Value> {
+pub fn repair_schemas(malformed: &[MalformedCall], specs: &[ToolSpec]) -> Vec<serde_json::Value> {
     let mut seen: Vec<&str> = Vec::new();
     let mut out = Vec::new();
     for m in malformed {
@@ -564,7 +561,7 @@ pub fn repair_schemas(
 
 /// One tool offered to the model: the name used for lookup plus the raw
 /// OpenAI tool object, which is what the repair prompt dumps verbatim.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
     pub name: String,
     pub raw: serde_json::Value,

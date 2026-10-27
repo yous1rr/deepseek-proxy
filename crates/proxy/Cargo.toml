@@ -13,6 +13,7 @@ pow = { path = "../pow" }
 protocol = { path = "../protocol" }
 client = { path = "../client" }
 responses-core = { path = "../responses-core" }
+tool-engine = { path = "../tool-engine" }
 chatgpt-client = { path = "../chatgpt-client" }
 chatgpt-protocol = { path = "../chatgpt-protocol" }
 serde.workspace = true

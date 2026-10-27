@@ -1,0 +1,10 @@
+[package]
+name = "tool-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Channel-independent prompted tool calling: wire dialect, schema validation, streaming filter and correction policy for upstreams that have no native function-call API."
+
+[dependencies]
+serde_json.workspace = true
+jsonschema.workspace = true

@@ -24,11 +24,20 @@ curl http://127.0.0.1:9174/v1/chat/completions \
   `previous_response_id` chains; unsupported parameters are rejected, never
   silently ignored. See [Responses API](#responses-api).
 - **Tool calling** — JSON-Schema validated arguments, and a bounded repair turn
-  when the model emits a malformed call instead of surfacing the error.
+  when the model emits a malformed call instead of surfacing the error. The
+  prompting, validation and repair policy lives in a channel-neutral crate
+  ([`crates/tool-engine`](crates/tool-engine)), so every prompted-tool upstream
+  shares it.
+- **ChatGPT Web channel** — `gpt-5*` and the image models served through the
+  same `/v1/responses` surface, with web search and image generation as hosted
+  tools. Tools are prompted there too, so a ChatGPT model can drive an agent.
 - **Branch-aware sessions** — resume matching histories with a delta; replay the
   selected history after edits, regeneration, or revision changes without client changes.
 - **Multiple accounts** — several DeepSeek accounts behind one endpoint, with
   per-account rate gating, health tracking, and failover.
+- **Runs without DeepSeek** — with only ChatGPT credentials configured the
+  proxy starts anyway; the DeepSeek channel answers `503 channel_unavailable`
+  and `/v1/models` advertises only what can actually be served.
 - **Long threads** — if the backend reports a context limit, the session is
   rebuilt and the transcript replayed once, transparently.
 - **Vision** — one image per turn, from a `data:` URL or a public HTTP URL.
@@ -138,6 +147,36 @@ itself. An explicit `DEEPSEEK_TOKEN_<i>` always wins.
 `deepseek-rs check` verifies login for every configured account and probes the
 PoW challenge path, exiting non-zero on failure.
 
+## ChatGPT Web accounts
+
+ChatGPT Web credentials are an **access token only** — the web session issues no
+refresh token, so nothing here can renew one. What the proxy can do is read the
+token's own `exp` claim and warn before it dies.
+
+```bash
+# reads the token from stdin, never from argv (no shell history, no process leak)
+pbpaste | deepseek-rs chatgpt add --access-token - --label work
+deepseek-rs chatgpt                # id, label, remaining life, last alert
+deepseek-rs chatgpt check          # remaining life + whether Bark is configured
+deepseek-rs chatgpt rm work
+```
+
+Configure [Bark](https://bark.day.app) for push warnings:
+
+```bash
+export BARK_KEY='your-bark-key'    # or BARK_URL=https://api.day.app/<key>
+```
+
+The server sweeps once an hour and pushes at **72 h**, **24 h** and **2 h** before
+expiry, once per stage per account; a failed push is retried on the next sweep.
+Without Bark the same warning goes to the log and the stage is still recorded, so
+it is not repeated. `CHATGPT_TOKEN_<i>` in the environment still works for a token
+you do not want stored; a stored row wins for the same identity because it
+carries the expiry metadata.
+
+Only `/v1/responses` serves ChatGPT models; `/v1/chat/completions` remains
+DeepSeek-only.
+
 ## Client authentication
 
 ```bash
@@ -170,8 +209,11 @@ closing before exposing the port.
  "requests":{"total":0,"ok":0,"errors":0,"auth_failed":0,"retries":0,
              "tool_calls":0,"images_dropped":0},
  "threads":{"in_memory":0},
- "db":{"threads":0,"bindings":0,"api_keys":0,"accounts":0,"cached_tokens":0},
- "accounts":[{"email":"...","healthy":true,"bound_threads":0,"waiting":0,"cooldown_ms":null}]}
+ "db":{"threads":0,"bindings":0,"api_keys":0,"accounts":0,"cached_tokens":0,"chatgpt_accounts":0},
+ "channels":{"deepseek_web":{"available":true,"accounts":1},
+             "chatgpt_web":{"available":false}},
+ "accounts":[{"email":"...","healthy":true,"bound_threads":0,"waiting":0,"cooldown_ms":null}],
+ "chatgpt_accounts":[{"id":"cg_...","label":"work","expires_in":86000,"last_alert":null}]}
 ```
 
 With the server down, `stats` falls back to database counts and says so on
@@ -207,6 +249,7 @@ model and how to add another upstream channel are described in
 against an isolated loopback proxy that serves a database copy; it reads that
 copy with read-only connections (except the `keys` command, which needs
 `--confirm-temporary-db`) and prints only checks and statuses.
+
 ## CLI
 
 ```
@@ -224,6 +267,10 @@ LOGS
 
 ACCOUNTS
   accounts | accounts add <email> <password> | accounts add <email> --token <t> | accounts rm <email>
+
+CHATGPT WEB ACCOUNTS  (access token only; there is no refresh path)
+  chatgpt | chatgpt check | chatgpt rm <id|label>
+  chatgpt add --access-token <token|-> [--label L] [--proxy URL]   '-' reads stdin
 
 API KEYS
   keys | keys add <name> <key> | keys rm <name|id>
@@ -258,9 +305,6 @@ private, CGNAT, and reserved ranges are refused, and redirects are not followed.
   `x-session-affinity`, `x-opencode-session`, `x-session-id`, and `session_id`.
   Without an explicit identity the first user message supplies a fallback hash.
   Distinct conversations should send distinct session keys.
-- **Context limits are recovered, not reported.** A limit on a continuation
-  triggers a fresh remote session and one transcript replay. Only before any
-  content is sent, and only for existing threads.
 - **Tool calls are repaired.** A malformed or schema-violating call gets a
   bounded correction turn instead of an error to the client.
 - **Rate limits retry before the first byte**, so streaming clients can still be

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pow", "crates/protocol", "crates/client", "crates/responses-core", "crates/proxy", "crates/chatgpt-client", "crates/chatgpt-protocol"]
+members = ["crates/pow", "crates/protocol", "crates/client", "crates/responses-core", "crates/tool-engine", "crates/proxy", "crates/chatgpt-client", "crates/chatgpt-protocol"]
 
 [workspace.package]
 version = "0.1.7"

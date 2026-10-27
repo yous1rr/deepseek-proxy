@@ -22,8 +22,8 @@ use crate::{
     delta_messages, dialect, error_for, estimate_tokens, find_token_usage, first_hint, images,
     invalid, is_supported_model, is_upstream_finished, persist_cursor, pool, queue_error,
     rebuild_session, resolve_tools, resolve_upstream_model_type, route_all, route_unavailable,
-    store, AppState, ChatRequest, CompletionError, Msg, ProxyError, Recovery, ThreadState,
-    TurnHistory,
+    store, tool_failure, AppState, ChatRequest, CompletionError, Msg, ProxyError, Recovery,
+    ThreadState, TurnHistory,
 };
 use axum::http::StatusCode;
 use futures_util::{future::BoxFuture, FutureExt, StreamExt};
@@ -688,22 +688,25 @@ async fn run(
     filter.calls.clear();
     let mut recovery = Recovery::new(specs, required, turn.parallel_tool_calls);
     if !truncated {
-        for event in dialect::scan(&text) {
-            if let Err(error) = recovery.accept(event) {
-                return Err(fail_with_cursor(&state, &key, &session_id, cursor, error));
-            }
+        if let Err(error) = recovery.accept_text(&text) {
+            return Err(fail_with_cursor(
+                &state,
+                &key,
+                &session_id,
+                cursor,
+                tool_failure(error),
+            ));
         }
-        recovery.require_call();
     }
     for repair_attempt in 1..=state.settings.tool_repair_max_retries {
-        if !recovery.has_pending() || cursor.is_none() {
+        if !recovery.needs_repair() || cursor.is_none() {
             break;
         }
         let repair_prompt = recovery.begin_repair();
         tracing::warn!(
             thread = %key,
             attempt = repair_attempt,
-            expected = recovery.expected,
+            expected = recovery.expected_count(),
             "tool repair"
         );
         let head = ThreadState {
@@ -740,27 +743,29 @@ async fn run(
         // The correction is now the newest upstream message. A missing id
         // revokes cursor trust instead of certifying the reply it fixed.
         cursor = repair_mid;
-        for event in dialect::scan(&repair_text) {
-            if let Err(error) = recovery.accept(event) {
-                return Err(fail_with_cursor(&state, &key, &session_id, cursor, error));
-            }
+        if let Err(error) = recovery.accept_text(&repair_text) {
+            return Err(fail_with_cursor(
+                &state,
+                &key,
+                &session_id,
+                cursor,
+                tool_failure(error),
+            ));
         }
         recovery.end_repair();
     }
-    if recovery.has_pending() {
-        return Err(fail_with_cursor(
-            &state,
-            &key,
-            &session_id,
-            cursor,
-            ProxyError::new(
-                "Could not recover a valid tool response",
-                StatusCode::BAD_GATEWAY,
-                "tool_repair_failed",
-            ),
-        ));
-    }
-    let accepted = recovery.calls;
+    let accepted = match recovery.finish() {
+        Ok(calls) => calls,
+        Err(error) => {
+            return Err(fail_with_cursor(
+                &state,
+                &key,
+                &session_id,
+                cursor,
+                tool_failure(error),
+            ))
+        }
+    };
 
     // Flush prose the tool filter held back at the very end of the stream.
     let tail = filter.finish();

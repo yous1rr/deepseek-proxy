@@ -461,6 +461,54 @@ async fn search_poll_returns_completed_answer_and_sources() {
     );
 }
 
+/// A caller-built transcript carries no message ids; the client must supply
+/// them instead of rejecting the request.
+#[tokio::test]
+async fn messages_without_ids_are_accepted_and_stamped() {
+    let (base, worker) = mock_server(common_replies(Reply::sse("data: [DONE]\n\n")));
+    let api = client(base, "token");
+    let response = api
+        .conversation(&ConversationRequest {
+            messages: vec![
+                json!({"author":{"role":"system"},"content":{"content_type":"text","parts":["rules"]}}),
+                json!({"author":{"role":"user"},"content":{"content_type":"text","parts":["hello"]}}),
+            ],
+            model: "gpt-5".into(),
+            thinking_effort: None,
+            system_hints: vec![],
+        })
+        .await
+        .unwrap();
+    drop(response);
+    let captured = worker.join().unwrap();
+    let body: Value = serde_json::from_slice(&captured[3].body).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    let ids: Vec<&str> = messages
+        .iter()
+        .map(|message| message["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.iter().all(|id| !id.is_empty()));
+    assert_ne!(ids[0], ids[1]);
+    assert!(messages[0]["metadata"].is_object());
+}
+
+#[tokio::test]
+async fn a_message_without_an_author_role_is_rejected() {
+    let (base, _worker) = mock_server(common_replies(Reply::sse("data: [DONE]\n\n")));
+    let api = client(base, "token");
+    let error = api
+        .conversation(&ConversationRequest {
+            messages: vec![json!({"id":"m1","content":{"content_type":"text","parts":["x"]}})],
+            model: "gpt-5".into(),
+            thinking_effort: None,
+            system_hints: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::InvalidRequest);
+}
+
 #[test]
 fn configuration_and_error_debug_are_redacted_and_classified() {
     let config = ClientConfig {

@@ -88,6 +88,10 @@ pub enum ConversationEvent {
         conversation_id: String,
     },
     TextDelta(String),
+    /// Reserved: the visible-message filter drops every non-`final` channel, so
+    /// no reasoning text is produced today. The variant stays so the adapter
+    /// and its tests do not have to change when a thought channel is mapped.
+    #[allow(dead_code)]
     ReasoningDelta(String),
     ImageTool {
         conversation_id: String,
@@ -707,12 +711,29 @@ fn replace_raw_text(state: &mut PatchState, text: &str) -> Result<(), ProtocolEr
     Ok(())
 }
 
+/// Text to emit for the step from `previous` to `current`.
+///
+/// The web stream is a snapshot per patch, not an append-only log, so `current`
+/// is not guaranteed to start with `previous`: a closed citation annotation can
+/// rewrite what was already sent (whitespace before punctuation is dropped) and
+/// a re-sent snapshot repeats text verbatim. Emitting only the part past the
+/// longest common prefix keeps the forwarded text equal to `current` instead of
+/// duplicating it, and emits nothing when the snapshot is unchanged.
 fn text_delta(previous: &str, current: &str) -> String {
     if let Some(suffix) = current.strip_prefix(previous) {
-        suffix.to_owned()
-    } else {
-        current.to_owned()
+        return suffix.to_owned();
     }
+    let common = previous
+        .char_indices()
+        .zip(current.chars())
+        .find(|((_, left), right)| left != right)
+        .map(|((index, _), _)| index)
+        .unwrap_or_else(|| previous.len().min(current.len()));
+    let boundary = (0..=common)
+        .rev()
+        .find(|index| current.is_char_boundary(*index))
+        .unwrap_or(0);
+    current[boundary..].to_owned()
 }
 
 /// Remove ChatGPT's private-use annotation markers while retaining readable
@@ -1122,13 +1143,18 @@ mod tests {
             .unwrap(),
             ConversationEvent::TextDelta(" world".into())
         );
+        // A `replace` that rewrites the text cannot be expressed over an
+        // append-only event stream. Only the part past the longest common
+        // prefix is sent, so an already-forwarded `<invoke>` block can never be
+        // repeated; the client keeps the stale remainder instead of seeing the
+        // snapshot twice.
         assert_eq!(
             consume_payload(
                 &mut state,
                 r#"{"p":"/message/content/parts/0","o":"replace","v":"Hi"}"#
             )
             .unwrap(),
-            ConversationEvent::TextDelta("Hi".into())
+            ConversationEvent::TextDelta("i".into())
         );
         assert_eq!(
             consume_payload(
@@ -1221,6 +1247,22 @@ mod tests {
             "Useful text. See Guide (https://example.test/page)."
         );
         assert_eq!(sanitize_text("visible\u{e200}unfinished"), "visible");
+    }
+
+    /// A closed citation annotation rewrites text that was already forwarded.
+    /// The incremental delta must describe the new snapshot, not repeat it.
+    #[test]
+    fn text_delta_reports_a_rewritten_snapshot_instead_of_repeating_it() {
+        // The annotation is unterminated at first, so sanitizing truncates the
+        // tail; once it closes, the whitespace before the period disappears.
+        assert_eq!(text_delta("See ", "See."), ".");
+        assert_eq!(text_delta("answer", "answer"), "");
+        assert_eq!(text_delta("answer", "answer more"), " more");
+        // A fully rewritten snapshot cannot be expressed incrementally.
+        assert_eq!(text_delta("abc", "xyz"), "xyz");
+        assert_eq!(text_delta("", "new"), "new");
+        // Multi-byte text must not be split mid-character.
+        assert_eq!(text_delta("答案", "答案：好了"), "：好了");
     }
 
     #[test]
