@@ -12,7 +12,7 @@ use crate::store::{ThreadHistory, ThreadResume};
 use crate::{AppState, ProxyError};
 use futures_util::future::BoxFuture;
 use responses_core::capability::CapabilitySet;
-use responses_core::events::{FunctionCall, Usage};
+use responses_core::events::{FunctionCall, HostedToolResult, Usage};
 use responses_core::plan::{FunctionTool, ReasoningEffort, ToolChoice, Verbosity};
 use responses_core::transcript::Item;
 use tokio::sync::mpsc;
@@ -31,6 +31,8 @@ pub struct TurnRequest {
     /// The full conversation: replayed stored context plus this input.
     pub transcript: Vec<Item>,
     pub tools: Vec<FunctionTool>,
+    /// Hosted Responses tool types requested by this turn, such as web_search.
+    pub hosted_tools: Vec<String>,
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -47,7 +49,7 @@ pub struct TurnRequest {
 }
 
 /// Progress reported while a turn runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     /// The upstream accepted the turn. Errors returned before this event are
     /// sent to the client as plain HTTP errors (so SDK retries keep working);
@@ -57,6 +59,8 @@ pub enum TurnEvent {
     Text(String),
     /// Raw reasoning text, when the channel exposes it.
     Reasoning(String),
+    /// A completed hosted-tool output item from the upstream channel.
+    Hosted(HostedToolResult),
 }
 
 /// Resumable upstream state to store with a successful turn.

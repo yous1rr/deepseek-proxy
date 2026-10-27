@@ -9,6 +9,7 @@
 //! The Chat Completions endpoint is untouched by this module.
 
 pub mod channel;
+pub mod chatgpt;
 pub mod deepseek;
 #[cfg(test)]
 mod tests;
@@ -41,53 +42,126 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 
-/// The active channel and its effective capabilities.
+/// One channel plus its effective capability set.
+#[derive(Clone)]
+struct ChannelRuntime {
+    channel: Arc<dyn ResponsesChannel>,
+    capabilities: CapabilitySet,
+}
+
+/// The active channels and their effective capabilities.
 #[derive(Clone)]
 pub struct Runtime {
+    /// Backward-compatible default channel used by existing unit-test helpers.
     pub channel: Arc<dyn ResponsesChannel>,
     pub capabilities: CapabilitySet,
+    channels: Vec<ChannelRuntime>,
 }
 
 impl Runtime {
-    /// Combine the channel ceiling, the engine limits and an optional
-    /// operator profile. Returns the runtime and non-fatal warnings.
+    /// Build a runtime for one channel.
     pub fn new(
         channel: Arc<dyn ResponsesChannel>,
         profile: Option<&ProfileDocument>,
     ) -> Result<(Self, Vec<String>), String> {
-        let mut capabilities = channel.capabilities();
-        if capabilities.channel() != channel.id() {
-            return Err(format!(
-                "channel '{}' declared capabilities for '{}'",
-                channel.id(),
-                capabilities.channel()
-            ));
+        Self::from_channels(vec![channel], profile)
+    }
+
+    /// Build a runtime for several model-routed channels.
+    pub fn from_channels(
+        channels: Vec<Arc<dyn ResponsesChannel>>,
+        profile: Option<&ProfileDocument>,
+    ) -> Result<(Self, Vec<String>), String> {
+        if channels.is_empty() {
+            return Err("at least one Responses channel is required".into());
         }
-        let mut warnings: Vec<String> = capabilities
-            .restrict_to_engine()
-            .into_iter()
-            .map(|id| {
+        let mut warnings = Vec::new();
+        let mut configured = Vec::with_capacity(channels.len());
+        let mut profile_applied = profile.is_none();
+        for channel in channels {
+            let mut capabilities = channel.capabilities();
+            if capabilities.channel() != channel.id() {
+                return Err(format!(
+                    "channel '{}' declared capabilities for '{}'",
+                    channel.id(),
+                    capabilities.channel()
+                ));
+            }
+            warnings.extend(capabilities.restrict_to_engine().into_iter().map(|id| {
                 format!("channel declares '{id}', which this engine cannot represent; disabled")
-            })
-            .collect();
-        if let Some(profile) = profile {
-            warnings.extend(
-                capabilities
-                    .narrow(profile)
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        Ok((
-            Self {
+            }));
+            if let Some(profile) = profile.filter(|profile| profile.channel == channel.id()) {
+                warnings.extend(
+                    capabilities
+                        .narrow(profile)
+                        .map_err(|error| error.to_string())?,
+                );
+                profile_applied = true;
+            }
+            configured.push(ChannelRuntime {
                 channel,
                 capabilities,
+            });
+        }
+        if !profile_applied {
+            let profile_channel = profile
+                .map(|profile| profile.channel.as_str())
+                .unwrap_or("");
+            return Err(format!(
+                "capability profile is for channel '{}', but no active channel matches it",
+                profile_channel
+            ));
+        }
+        let default = configured.first().cloned().expect("non-empty channel list");
+        Ok((
+            Self {
+                channel: default.channel,
+                capabilities: default.capabilities,
+                channels: configured,
             },
             warnings,
         ))
     }
 
+    /// Select the channel and capability set that can serve one model.
+    pub fn for_model(&self, model: &str) -> Option<(Arc<dyn ResponsesChannel>, CapabilitySet)> {
+        self.channels
+            .iter()
+            .find(|runtime| runtime.channel.supports_model(model))
+            .map(|runtime| (runtime.channel.clone(), runtime.capabilities.clone()))
+    }
+
+    /// Build a multi-channel runtime at startup, reading the optional profile file.
+    pub fn load_channels(
+        channels: Vec<Arc<dyn ResponsesChannel>>,
+        profile_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
+        let document = match &profile_path {
+            None => None,
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(|error| {
+                    format!("read capability profile {}: {error}", path.display())
+                })?;
+                Some(ProfileDocument::parse(&bytes).map_err(|error| error.to_string())?)
+            }
+        };
+        let (runtime, warnings) = Self::from_channels(channels, document.as_ref())?;
+        for warning in warnings {
+            tracing::warn!("{warning}");
+        }
+        tracing::info!(
+            channels = %runtime
+                .channels
+                .iter()
+                .map(|channel| channel.channel.id())
+                .collect::<Vec<_>>()
+                .join(","),
+            profile = profile_path.is_some(),
+            "Responses capabilities"
+        );
+        Ok(runtime)
+    }
     /// Build the runtime at startup, reading the optional profile file.
-    /// A missing, malformed or mismatched profile is a startup error.
     pub fn load(
         channel: Arc<dyn ResponsesChannel>,
         profile_path: Option<std::path::PathBuf>,
@@ -114,7 +188,6 @@ impl Runtime {
         Ok(runtime)
     }
 }
-
 /// Messages from a turn task to the HTTP handler.
 enum Outbound {
     /// The upstream accepted the turn; the response is committed to HTTP 200.
@@ -324,14 +397,26 @@ pub async fn create(State(state): State<AppState>, headers: HeaderMap, body: Byt
         }
     };
     let runtime = state.responses.clone();
-    // `max_output_tokens` is enforced by the proxy, not the upstream, so the
-    // channel limit decides validity: within it the turn runs and is truncated
-    // locally, above it the request is rejected. A channel with no configured
-    // limit keeps the fail-closed behaviour and still needs the capability.
+    let model = plan
+        .model
+        .clone()
+        .unwrap_or_else(|| state.settings.model_name.clone());
+    let Some((channel, capabilities)) = runtime.for_model(&model) else {
+        state.stats.errors.fetch_add(1, Ordering::Relaxed);
+        return ProxyError::new(
+            "Unknown model; see /v1/models",
+            StatusCode::BAD_REQUEST,
+            "model_not_found",
+        )
+        .with_param("model")
+        .into_response();
+    };
+    // `max_output_tokens` is enforced by the proxy where a channel has a local
+    // budget. A channel without a budget remains fail-closed.
     let channel_limit = state
         .settings
         .channel_max_output_tokens
-        .get(runtime.channel.id())
+        .get(channel.id())
         .copied();
     if let Some(requested) = plan.echo.max_output_tokens {
         match channel_limit {
@@ -347,36 +432,25 @@ pub async fn create(State(state): State<AppState>, headers: HeaderMap, body: Byt
                 .with_param("max_output_tokens")
                 .into_response();
             }
-            // Within the channel limit the proxy truncates locally, so the
-            // capability gate must not reject the request.
             Some(_) => {}
-            None => {
-                if !runtime.capabilities.enabled(Capability::MaxOutputTokens) {
-                    state.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    return ProxyError::new(
-                        format!(
-                            "'max_output_tokens' requires capability 'max_output_tokens', which channel '{}' does not support",
-                            runtime.channel.id()
-                        ),
-                        StatusCode::BAD_REQUEST,
-                        "unsupported_parameter",
-                    )
-                    .with_param("max_output_tokens")
-                    .into_response();
-                }
+            None if !capabilities.enabled(Capability::MaxOutputTokens) => {
+                state.stats.errors.fetch_add(1, Ordering::Relaxed);
+                return ProxyError::new(
+                    format!(
+                        "'max_output_tokens' requires capability 'max_output_tokens', which channel '{}' does not support",
+                        channel.id()
+                    ),
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_parameter",
+                )
+                .with_param("max_output_tokens")
+                .into_response();
             }
+            None => {}
         }
     }
-    // A channel limit already validated the field above; only gate on the
-    // capability when the proxy has no budget of its own to enforce.
-    //
-    // Sampling parameters are accepted in fresh-session decision mode: those
-    // callers (magpie's classifier asks at temperature 0) send a fixed value
-    // that this channel has no way to honour, and refusing it turns every
-    // decision call into a 400. The values are dropped, not forwarded, so the
-    // capability stays honest for every other mode.
     let ignored_sampling = state.settings.fresh_session_per_request;
-    let requirement = plan.unmet(&runtime.capabilities).filter(|requirement| {
+    let requirement = plan.unmet(&capabilities).filter(|requirement| {
         if requirement.capability == Capability::MaxOutputTokens && channel_limit.is_some() {
             return false;
         }
@@ -384,30 +458,15 @@ pub async fn create(State(state): State<AppState>, headers: HeaderMap, body: Byt
     });
     if let Some(requirement) = requirement {
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
-        return request_error(gate(&runtime.capabilities, requirement));
-    }
-    let model = plan
-        .model
-        .clone()
-        .unwrap_or_else(|| state.settings.model_name.clone());
-    if !runtime.channel.supports_model(&model) {
-        state.stats.errors.fetch_add(1, Ordering::Relaxed);
-        return ProxyError::new(
-            "Unknown model; see /v1/models",
-            StatusCode::BAD_REQUEST,
-            "model_not_found",
-        )
-        .with_param("model")
-        .into_response();
+        return request_error(gate(&capabilities, requirement));
     }
     if let Err(error) = validate_tool_schemas(&plan) {
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
         return request_error(error);
     }
-
     // `store` is honoured only when the channel enables stored responses.
-    let store = plan.store_requested && runtime.capabilities.enabled(Capability::StoredResponses);
-    let reasoning = runtime.capabilities.enabled(Capability::Reasoning);
+    let store = plan.store_requested && capabilities.enabled(Capability::StoredResponses);
+    let reasoning = capabilities.enabled(Capability::Reasoning);
 
     // An unknown parent, or one owned by another key, is a request error.
     let parent = match plan.previous_response_id.as_deref() {
@@ -442,9 +501,9 @@ pub async fn create(State(state): State<AppState>, headers: HeaderMap, body: Byt
     };
     // Replayed context is gated like fresh input: a narrowed profile must not
     // be bypassed by content an earlier configuration accepted.
-    if let Some(requirement) = replay_requirement(&transcript, &runtime.capabilities) {
+    if let Some(requirement) = replay_requirement(&transcript, &capabilities) {
         state.stats.errors.fetch_add(1, Ordering::Relaxed);
-        return request_error(gate(&runtime.capabilities, &requirement));
+        return request_error(gate(&capabilities, &requirement));
     }
     transcript.extend(plan.input.iter().cloned());
     let thread_id = parent
@@ -472,6 +531,14 @@ pub async fn create(State(state): State<AppState>, headers: HeaderMap, body: Byt
         instructions: plan.instructions.clone(),
         transcript,
         tools: plan.tools.clone(),
+        hosted_tools: plan
+            .echo
+            .tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool.get("type").and_then(Value::as_str).map(str::to_string))
+            .collect(),
         tool_choice: plan.tool_choice.clone(),
         parallel_tool_calls: plan.parallel_tool_calls,
         // Without the capability the channel is asked not to reason at all,
@@ -596,6 +663,7 @@ async fn forward(
         TurnEvent::Text(text) => encoder.text_delta(&text),
         TurnEvent::Reasoning(text) if job.reasoning => encoder.reasoning_delta(&text),
         TurnEvent::Reasoning(_) => return true,
+        TurnEvent::Hosted(result) => encoder.hosted_tool_completed(result),
     };
     send_events(out, job.stream, events).await
 }

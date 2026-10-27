@@ -37,6 +37,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chatgpt_client::{ChatGptClient, ClientConfig};
 use client::{CompletionBody, COMPLETION_PATH};
 use futures_util::StreamExt;
 use protocol::{route_event, Channel, FragmentRouter};
@@ -757,16 +758,75 @@ async fn stats(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// `GET /v1/models` — the same three ids Python advertises, in the same shape.
-async fn models(_state: State<AppState>) -> Json<Value> {
-    Json(json!({
+static CHATGPT_CONFIG: std::sync::RwLock<Option<config::ChatGptConfig>> =
+    std::sync::RwLock::new(None);
+
+pub fn set_chatgpt_config(cfg: config::ChatGptConfig) {
+    if let Ok(mut lock) = CHATGPT_CONFIG.write() {
+        *lock = Some(cfg);
+    }
+}
+
+pub fn get_chatgpt_config() -> config::ChatGptConfig {
+    if let Ok(lock) = CHATGPT_CONFIG.read() {
+        if let Some(cfg) = &*lock {
+            return cfg.clone();
+        }
+    }
+    config::Config::load()
+        .map(|c| c.chatgpt)
+        .unwrap_or_default()
+}
+
+/// Build the list of advertised models based on current ChatGPT configuration.
+///
+/// Returns existing base entries (`DEFAULT`, `EXPERT`, `VISION`) plus ChatGPT entries
+/// when the ChatGPT Web channel is enabled and has valid tokens configured.
+/// The list is deduplicated, returned in stable order, and matches the Google/OpenAI shape
+/// (`object=list`, `id/object/created/owned_by`).
+pub(crate) fn build_models_list(chatgpt: &config::ChatGptConfig) -> Value {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let base_models = [
+        ("DEFAULT", "deepseek"),
+        ("EXPERT", "deepseek"),
+        ("VISION", "deepseek"),
+    ];
+
+    for (id, owner) in base_models {
+        if seen.insert(id.to_string()) {
+            entries.push(json!({
+                "id": id,
+                "object": "model",
+                "created": 0,
+                "owned_by": owner,
+            }));
+        }
+    }
+
+    if chatgpt.should_advertise_models() {
+        for id in config::chatgpt_models() {
+            if seen.insert(id.to_string()) {
+                entries.push(json!({
+                    "id": id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "chatgpt",
+                }));
+            }
+        }
+    }
+
+    json!({
         "object": "list",
-        "data": [
-            {"id": "DEFAULT", "object": "model", "created": 0, "owned_by": "deepseek"},
-            {"id": "EXPERT", "object": "model", "created": 0, "owned_by": "deepseek"},
-            {"id": "VISION", "object": "model", "created": 0, "owned_by": "deepseek"},
-        ]
-    }))
+        "data": entries,
+    })
+}
+
+/// `GET /v1/models` — current entries plus ChatGPT entries when enabled.
+async fn models(_state: State<AppState>) -> Json<Value> {
+    Json(build_models_list(&get_chatgpt_config()))
 }
 
 /// Reject the request unless the bearer key is known (or none are registered).
@@ -2828,6 +2888,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channel_max_output_tokens: cfg.channel_max_output_tokens.clone(),
         fresh_session_per_request: cfg.fresh_session_per_request,
     };
+    set_chatgpt_config(cfg.chatgpt.clone());
     tracing::info!(
         db_path = %cfg.db_path,
         model = %settings.model_name,
@@ -2836,14 +2897,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "settings loaded"
     );
 
+    // Build the active Responses channels. ChatGPT Web is model-routed and
+    // only registered when authenticated tokens are configured.
+    let mut response_channels: Vec<Arc<dyn responses::channel::ResponsesChannel>> =
+        vec![Arc::new(responses::deepseek::DeepSeekWeb)];
+    if cfg.chatgpt.should_advertise_models() {
+        let clients = cfg
+            .chatgpt
+            .tokens
+            .iter()
+            .map(|token| {
+                ChatGptClient::new(ClientConfig {
+                    base_url: cfg.chatgpt.base_url.clone(),
+                    access_token: token.clone(),
+                    proxy_url: cfg.chatgpt.proxy_url.clone(),
+                    timeout: std::time::Duration::from_secs_f64(cfg.chatgpt.timeout_secs),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let channel =
+            responses::chatgpt::ChatGptWeb::new(clients).map_err(|error| error.to_string())?;
+        response_channels.push(Arc::new(channel));
+        tracing::info!(models = ?config::chatgpt_models(), "ChatGPT Web Responses channel enabled");
+    }
     // A missing, malformed or mismatched capability profile is a startup
     // error: silently falling back could enable features the operator meant
     // to disable.
-    let responses = responses::Runtime::load(
-        Arc::new(responses::deepseek::DeepSeekWeb),
+    let responses = responses::Runtime::load_channels(
+        response_channels,
         std::env::var_os("RESPONSES_CAPABILITY_PROFILE").map(std::path::PathBuf::from),
     )?;
-
     let state = AppState {
         pool,
         settings,
@@ -3964,5 +4047,95 @@ mod tests {
         let conn = state.pool.any();
         let _slot = conn.acquire().await.unwrap();
         drop(guard);
+    }
+
+    #[test]
+    fn test_models_advertisement_disabled_or_no_tokens() {
+        // 1. Channel disabled completely
+        let mut chatgpt = config::ChatGptConfig::default();
+        chatgpt.enabled = false;
+        chatgpt.tokens = vec!["tok-1".into()];
+        let list = build_models_list(&chatgpt);
+        assert_eq!(list["object"], "list");
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["DEFAULT", "EXPERT", "VISION"]);
+        for m in data {
+            assert_eq!(m["object"], "model");
+            assert_eq!(m["created"], 0);
+            assert_eq!(m["owned_by"], "deepseek");
+        }
+
+        // 2. Channel enabled but no tokens (cannot run anonymously)
+        chatgpt.enabled = true;
+        chatgpt.tokens = vec![];
+        let list = build_models_list(&chatgpt);
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["DEFAULT", "EXPERT", "VISION"]);
+    }
+
+    #[test]
+    fn test_models_advertisement_enabled_with_tokens() {
+        let mut chatgpt = config::ChatGptConfig::default();
+        chatgpt.enabled = true;
+        chatgpt.tokens = vec!["tok-1".into()];
+
+        let list = build_models_list(&chatgpt);
+        assert_eq!(list["object"], "list");
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        // 3 base models + 9 ChatGPT models in stable order
+        let expected_ids = vec![
+            "DEFAULT",
+            "EXPERT",
+            "VISION",
+            "auto",
+            "gpt-5",
+            "gpt-5-1",
+            "gpt-5-2",
+            "gpt-5-3",
+            "gpt-5-3-mini",
+            "gpt-5-mini",
+            "gpt-image-2",
+            "codex-gpt-image-2",
+        ];
+        assert_eq!(ids, expected_ids);
+
+        // Verify shape and ownership
+        for m in &data[..3] {
+            assert_eq!(m["object"], "model");
+            assert_eq!(m["created"], 0);
+            assert_eq!(m["owned_by"], "deepseek");
+        }
+        for m in &data[3..] {
+            assert_eq!(m["object"], "model");
+            assert_eq!(m["created"], 0);
+            assert_eq!(m["owned_by"], "chatgpt");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_models_handler_execution() {
+        let state = branch_test_state().await;
+        // Test disabled
+        let mut cfg = config::ChatGptConfig::default();
+        cfg.enabled = false;
+        set_chatgpt_config(cfg);
+        let Json(val) = models(State(state.clone())).await;
+        assert_eq!(val["object"], "list");
+        let data = val["data"].as_array().unwrap();
+        assert_eq!(data.len(), 3);
+
+        // Test enabled with token
+        let mut cfg_enabled = config::ChatGptConfig::default();
+        cfg_enabled.enabled = true;
+        cfg_enabled.tokens = vec!["active_token".into()];
+        set_chatgpt_config(cfg_enabled);
+        let Json(val_enabled) = models(State(state)).await;
+        assert_eq!(val_enabled["object"], "list");
+        let data_enabled = val_enabled["data"].as_array().unwrap();
+        assert_eq!(data_enabled.len(), 12);
     }
 }

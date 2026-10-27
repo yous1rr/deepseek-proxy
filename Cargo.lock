@@ -212,6 +212,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "chatgpt-client"
+version = "0.1.6"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "chatgpt-protocol"
+version = "0.1.6"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "client"
 version = "0.1.6"
 dependencies = [
@@ -1097,6 +1117,8 @@ version = "0.1.6"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "chatgpt-client",
+ "chatgpt-protocol",
  "client",
  "futures-util",
  "hex",

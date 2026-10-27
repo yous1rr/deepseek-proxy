@@ -52,6 +52,15 @@ fresh_session_per_request = false
 # `max_output_tokens` unsupported (fail closed) for this channel.
 max_output_tokens = 384000
 
+# [chatgpt]
+# # Optional ChatGPT Web upstream channel transport settings.
+# # Credentials (CHATGPT_TOKEN_<n> / CHATGPT_ACCESS_TOKEN_<n>) live in environment
+# # variables only — never in this file.
+# enabled = false
+# base_url = "https://chatgpt.com"
+# timeout_secs = 60.0
+# # proxy_url = "http://127.0.0.1:7890"
+
 [limits]
 # Seconds to wait after a request finishes before starting the next one on
 # the same account. Completion-to-start, not start-to-start.

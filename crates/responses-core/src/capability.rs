@@ -159,6 +159,8 @@ impl Capability {
                 | Self::FileInput
                 | Self::FunctionTools
                 | Self::ToolChoice
+                | Self::WebSearch
+                | Self::ImageGeneration
                 | Self::Reasoning
                 | Self::Verbosity
                 | Self::SamplingControls
@@ -547,12 +549,12 @@ mod tests {
     #[test]
     fn engine_masks_capabilities_it_cannot_represent() {
         let mut set = ceiling().with(
-            Capability::WebSearch,
+            Capability::CodeInterpreter,
             CapabilityStatus::supported(Provider::Upstream, "native"),
         );
         let masked = set.restrict_to_engine();
-        assert_eq!(masked, vec!["web_search"]);
-        assert!(!set.enabled(Capability::WebSearch));
+        assert_eq!(masked, vec!["code_interpreter"]);
+        assert!(!set.enabled(Capability::CodeInterpreter));
         assert!(set.enabled(Capability::Text));
     }
 }

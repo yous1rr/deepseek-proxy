@@ -47,7 +47,7 @@
 - `reasoning` 未启用时，HTTP 层要求渠道使用 effort `none`，并且不转发渠道产生的任何推理事件。
 - `stored_responses` 未启用时，`store` 强制为 `false`。
 
-引擎当前能表示的能力：`text`、`streaming`、`non_streaming`、`image_input`、`file_input`、`function_tools`、`tool_choice`、`reasoning`、`verbosity`、`sampling_controls`、`max_output_tokens`、`stored_responses`、`previous_response`、`exact_usage`。托管工具、自定义工具、结构化输出、logprobs、conversations、background、流恢复、自动截断、compaction、提示模板还没有请求或事件表示，任何渠道都不能启用。
+引擎当前能表示的能力：`text`、`streaming`、`non_streaming`、`image_input`、`file_input`、`function_tools`、`tool_choice`、`web_search`、`image_generation`、`reasoning`、`verbosity`、`sampling_controls`、`max_output_tokens`、`stored_responses`、`previous_response`、`exact_usage`。代码解释器、自定义工具、结构化输出、logprobs、conversations、background、流恢复、自动截断、compaction、提示模板仍没有完整请求或事件表示，不能启用。
 
 ## 存储与续接
 
@@ -78,6 +78,23 @@
 
 其余 20 个能力都以明确原因声明为 unsupported，例如 `no_upstream_sampling_parameters`、`hosted_tool_not_implemented`、`output_tokens_estimated_locally`。输入 token 来自上游，输出 token 为本地估算，因此 `exact_usage` 未启用。
 
+
+## ChatGPT Web 渠道（`chatgpt_web`）
+
+ChatGPT Web 通过 `ResponsesChannel` 接入，并按模型与 DeepSeek 渠道并行路由。`chatgpt2api` 的 Python 实现被拆成三个 Rust 模块：`chatgpt-client` 负责 HTTP、Sentinel/PoW、Turnstile 受限解释器、图片上传/下载和搜索轮询；`chatgpt-protocol` 负责 JSON Patch SSE、可见文本、搜索来源和图片指针提取；`responses/chatgpt.rs` 负责 `TurnRequest` 映射和 Responses 事件装配。
+
+| 能力 | 提供方 / 方式 |
+|---|---|
+| `text`、`streaming`、`non_streaming` | ChatGPT Web conversation SSE / `response` patch re-encoded |
+| `reasoning` | ChatGPT Web `thought`/隐藏 channel 过滤后的 reasoning delta |
+| `image_input` | `/backend-api/files` 上传并注入 `file-service://` asset pointer |
+| `web_search` | `system_hints: ["search"]`、搜索源轮询、`web_search_call` output item |
+| `image_generation` | `async_task_type=image_gen`、安全文件轮询、`image_generation_call` Base64 result |
+| `stored_responses`、`previous_response` | proxy 本地 transcript replay；上游不伪造 cursor |
+
+ChatGPT access token 只从 `CHATGPT_TOKEN_<n>`/`CHATGPT_ACCESS_TOKEN_<n>` 环境变量读取。配置了有效 token 后，`GET /v1/models` 才广告 `auto`、`gpt-5*`、`gpt-image-2` 和 `codex-gpt-image-2`；没有 token 时不会把不可用模型放进目录。`code_interpreter` 仍由能力门控拒绝，直到有可靠的沙箱事件映射。
+
+Rust 客户端使用 `reqwest`/rustls，并明确不声称复现 `curl_cffi` 的 Chrome TLS ClientHello 指纹；若上游要求浏览器指纹，需单独替换传输层。PoW 使用 SHA3-512 原生实现，Turnstile 只执行固定的 allowlisted bytecode 子集，不执行任意 JavaScript。
 ## 接入新渠道
 
 1. 在 `crates/proxy/src/responses/` 下新建模块并实现 `ResponsesChannel`：
